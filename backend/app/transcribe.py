@@ -24,6 +24,7 @@ ALLOWED_EXTENSIONS = {
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_AUDIO_DIR = Path("/audios")
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output"
+SUPPORTED_DEVICES = {"cpu", "cuda", "rocm"}
 
 
 def _read_env_setting(name: str) -> Optional[str]:
@@ -34,12 +35,40 @@ def _read_env_setting(name: str) -> Optional[str]:
     return normalized or None
 
 
+def normalize_device(device: str) -> str:
+    normalized = device.strip().lower()
+    if normalized in SUPPORTED_DEVICES:
+        return normalized
+    raise ValueError(
+        f"Unsupported WHISPER_DEVICE '{device}'. Supported values: {', '.join(sorted(SUPPORTED_DEVICES))}."
+    )
+
+
+def get_runtime_device(device: str) -> str:
+    normalized = normalize_device(device)
+    if normalized == "rocm":
+        # ROCm-enabled CTranslate2 builds expose the GPU backend through "cuda".
+        return "cuda"
+    return normalized
+
+
+def apply_rocm_env_overrides() -> None:
+    # Optional helper envs for legacy/unsupported ROCm cards (for example Vega).
+    hsa_override = _read_env_setting("WHISPER_HSA_OVERRIDE_GFX_VERSION")
+    if hsa_override and not _read_env_setting("HSA_OVERRIDE_GFX_VERSION"):
+        os.environ["HSA_OVERRIDE_GFX_VERSION"] = hsa_override
+
+    rocr_visible = _read_env_setting("WHISPER_ROCR_VISIBLE_DEVICES")
+    if rocr_visible and not _read_env_setting("ROCR_VISIBLE_DEVICES"):
+        os.environ["ROCR_VISIBLE_DEVICES"] = rocr_visible
+
+
 def is_cpu_device(device: str) -> bool:
-    return device.strip().lower().startswith("cpu")
+    return normalize_device(device) == "cpu"
 
 
 def get_default_device() -> str:
-    return (_read_env_setting("WHISPER_DEVICE") or "cuda").lower()
+    return normalize_device(_read_env_setting("WHISPER_DEVICE") or "cuda")
 
 
 def get_default_compute_type(device: str) -> str:
@@ -85,11 +114,14 @@ class AudioLibraryFile:
 
 class ModelManager:
     def __init__(self, device: Optional[str] = None, compute_type: Optional[str] = None) -> None:
-        resolved_device = (device or DEFAULT_DEVICE).strip().lower()
+        resolved_device = normalize_device(device or DEFAULT_DEVICE)
+        if resolved_device == "rocm":
+            apply_rocm_env_overrides()
         resolved_compute_type = (
             compute_type.strip().lower() if compute_type and compute_type.strip() else get_default_compute_type(resolved_device)
         )
         self.device = resolved_device
+        self.runtime_device = get_runtime_device(resolved_device)
         self.compute_type = resolved_compute_type
         self._models: dict[str, WhisperModel] = {}
         self._lock = threading.Lock()
@@ -100,11 +132,17 @@ class ModelManager:
                 return self._models[model_name]
 
             try:
-                model = WhisperModel(model_name, device=self.device, compute_type=self.compute_type)
+                model = WhisperModel(model_name, device=self.runtime_device, compute_type=self.compute_type)
             except Exception as exc:  # noqa: BLE001
+                runtime_hint = (
+                    f"{self.device} (mapped runtime backend: {self.runtime_device})"
+                    if self.device != self.runtime_device
+                    else self.device
+                )
                 raise TranscriptionError(
-                    f"Failed to initialize model '{model_name}' with device={self.device}, "
-                    f"compute_type={self.compute_type}. If using CUDA, ensure NVIDIA drivers/CUDA are installed. "
+                    f"Failed to initialize model '{model_name}' with device={runtime_hint}, "
+                    f"compute_type={self.compute_type}. For WHISPER_DEVICE=rocm, install a ROCm-enabled "
+                    "CTranslate2 build and pass ROCm devices into the container/host runtime. "
                     f"Original error: {exc}"
                 ) from exc
 

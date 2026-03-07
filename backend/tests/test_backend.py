@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import zipfile
 from pathlib import Path
 
@@ -13,9 +14,12 @@ from app.transcribe import (
     ModelManager,
     SegmentResult,
     TranscriptionInfo,
+    apply_rocm_env_overrides,
     get_default_compute_type,
     get_default_device,
+    get_runtime_device,
     is_cpu_device,
+    normalize_device,
     validate_upload,
 )
 
@@ -55,6 +59,7 @@ def test_cpu_compute_type_defaults_to_int8() -> None:
 def test_non_cpu_compute_type_defaults_to_float16() -> None:
     assert not is_cpu_device("cuda")
     assert get_default_compute_type("cuda") == "float16"
+    assert get_default_compute_type("rocm") == "float16"
 
 
 def test_compute_type_env_override(monkeypatch) -> None:
@@ -71,6 +76,30 @@ def test_model_manager_uses_int8_when_device_is_cpu() -> None:
     manager = ModelManager(device="cpu")
     assert manager.device == "cpu"
     assert manager.compute_type == "int8"
+
+
+def test_rocm_device_maps_to_cuda_runtime() -> None:
+    manager = ModelManager(device="rocm")
+    assert manager.device == "rocm"
+    assert manager.runtime_device == "cuda"
+    assert manager.compute_type == "float16"
+
+
+def test_device_normalization() -> None:
+    assert normalize_device(" CPU ") == "cpu"
+    assert get_runtime_device("rocm") == "cuda"
+
+
+def test_apply_rocm_env_overrides(monkeypatch) -> None:
+    monkeypatch.delenv("HSA_OVERRIDE_GFX_VERSION", raising=False)
+    monkeypatch.delenv("ROCR_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setenv("WHISPER_HSA_OVERRIDE_GFX_VERSION", "9.0.0")
+    monkeypatch.setenv("WHISPER_ROCR_VISIBLE_DEVICES", "0")
+
+    apply_rocm_env_overrides()
+
+    assert os.getenv("HSA_OVERRIDE_GFX_VERSION") == "9.0.0"
+    assert os.getenv("ROCR_VISIBLE_DEVICES") == "0"
 
 
 def test_list_audios_endpoint(monkeypatch) -> None:
