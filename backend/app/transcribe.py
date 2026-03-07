@@ -20,6 +20,10 @@ ALLOWED_EXTENSIONS = {
     ".ogg",
     ".flac",
     ".webm",
+    ".3gp",
+    ".amr",
+    ".opus",
+    ".caf",
 }
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_AUDIO_DIR = Path("/audios")

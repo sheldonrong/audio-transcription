@@ -41,6 +41,13 @@ def test_validate_upload_extension() -> None:
         assert "Unsupported file extension" in str(exc)
 
 
+def test_validate_upload_mobile_memo_extensions() -> None:
+    validate_upload("voice-note.m4a", b"abc")
+    validate_upload("voice-note.3gp", b"abc")
+    validate_upload("voice-note.amr", b"abc")
+    validate_upload("voice-note.opus", b"abc")
+
+
 def test_health_endpoint() -> None:
     client = TestClient(app)
     response = client.get("/health")
@@ -120,6 +127,57 @@ def test_list_audios_endpoint(monkeypatch) -> None:
     assert len(body["files"]) == 2
     assert body["files"][0]["url"].endswith("/audios/sample.wav")
     assert body["files"][1]["url"].endswith("/audios/set/nested.mp3")
+
+
+def test_upload_audio_endpoint(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("app.main.audio_library_dir", tmp_path)
+
+    client = TestClient(app)
+    response = client.post(
+        "/api/audios/upload",
+        files={"file": ("meeting.wav", b"fake audio payload", "audio/wav")},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["filename"] == "meeting.wav"
+    assert body["path"] == "meeting.wav"
+    assert body["size_bytes"] == len(b"fake audio payload")
+    assert body["url"].endswith("/audios/meeting.wav")
+    assert (tmp_path / "meeting.wav").read_bytes() == b"fake audio payload"
+
+
+def test_upload_audio_endpoint_with_duplicate_name(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("app.main.audio_library_dir", tmp_path)
+    (tmp_path / "meeting.wav").write_bytes(b"existing")
+
+    client = TestClient(app)
+    response = client.post(
+        "/api/audios/upload",
+        files={"file": ("meeting.wav", b"new audio payload", "audio/wav")},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["filename"] == "meeting-1.wav"
+    assert body["path"] == "meeting-1.wav"
+    assert (tmp_path / "meeting.wav").read_bytes() == b"existing"
+    assert (tmp_path / "meeting-1.wav").read_bytes() == b"new audio payload"
+
+
+def test_upload_audio_endpoint_rejects_non_audio(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("app.main.audio_library_dir", tmp_path)
+
+    client = TestClient(app)
+    response = client.post(
+        "/api/audios/upload",
+        files={"file": ("notes.txt", b"not audio", "text/plain")},
+    )
+
+    assert response.status_code == 400
+    body = response.json()
+    assert "Unsupported file extension" in body["detail"]
+    assert not (tmp_path / "notes.txt").exists()
 
 
 def test_ws_transcribe_success(monkeypatch) -> None:
@@ -293,6 +351,32 @@ def test_load_transcription_file_and_audio_stream(monkeypatch, tmp_path) -> None
     )
     assert audio_response.status_code == 200
     assert audio_response.content == b"audio bytes"
+    assert audio_response.headers.get("accept-ranges") == "bytes"
+
+    partial_response = client.get(
+        "/api/exports/sample-export.tsp/audio",
+        params={"member": "sample.wav"},
+        headers={"Range": "bytes=6-9"},
+    )
+    assert partial_response.status_code == 206
+    assert partial_response.content == b"byte"
+    assert partial_response.headers.get("content-range") == "bytes 6-9/11"
+
+    suffix_response = client.get(
+        "/api/exports/sample-export.tsp/audio",
+        params={"member": "sample.wav"},
+        headers={"Range": "bytes=-5"},
+    )
+    assert suffix_response.status_code == 206
+    assert suffix_response.content == b"bytes"
+    assert suffix_response.headers.get("content-range") == "bytes 6-10/11"
+
+    invalid_range_response = client.get(
+        "/api/exports/sample-export.tsp/audio",
+        params={"member": "sample.wav"},
+        headers={"Range": "bytes=20-30"},
+    )
+    assert invalid_range_response.status_code == 416
 
 
 def test_ws_transcribe_invalid_start_message() -> None:

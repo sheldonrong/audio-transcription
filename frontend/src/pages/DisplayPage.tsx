@@ -269,26 +269,79 @@ export default function DisplayPage({ title, transcript, segments }: Props) {
       const start = Math.max(0, startTime);
       const end = Math.max(start, endTime);
       const durationMs = Math.max(0, (end - start) * 1000);
+      const audio = audioRef.current;
 
-      stopPlayback();
-      audioRef.current.currentTime = start;
-      setActivePlaybackKey(playbackKey);
-      setPlayWindow({ start, end });
-      setPlayheadSeconds(start);
+      const startPlayback = async () => {
+        stopPlayback();
 
-      const playback = audioRef.current.play();
-      if (playback instanceof Promise) {
-        playback.catch((error: unknown) => {
+        try {
+          if (audio.readyState < 1) {
+            await new Promise<void>((resolve, reject) => {
+              const onLoaded = () => {
+                cleanup();
+                resolve();
+              };
+              const onError = () => {
+                cleanup();
+                reject(new Error("Unable to load audio metadata."));
+              };
+              const cleanup = () => {
+                audio.removeEventListener("loadedmetadata", onLoaded);
+                audio.removeEventListener("error", onError);
+              };
+
+              audio.addEventListener("loadedmetadata", onLoaded);
+              audio.addEventListener("error", onError);
+              audio.load();
+            });
+          }
+
+          audio.currentTime = start;
+          await new Promise<void>((resolve) => {
+            if (Math.abs(audio.currentTime - start) <= 0.05) {
+              resolve();
+              return;
+            }
+
+            const onSeeked = () => {
+              cleanup();
+              resolve();
+            };
+            const onError = () => {
+              cleanup();
+              resolve();
+            };
+            const timeoutId = window.setTimeout(() => {
+              cleanup();
+              resolve();
+            }, 600);
+            const cleanup = () => {
+              window.clearTimeout(timeoutId);
+              audio.removeEventListener("seeked", onSeeked);
+              audio.removeEventListener("error", onError);
+            };
+
+            audio.addEventListener("seeked", onSeeked);
+            audio.addEventListener("error", onError);
+          });
+
+          setActivePlaybackKey(playbackKey);
+          setPlayWindow({ start, end });
+          setPlayheadSeconds(start);
+          await audio.play();
+
+          stopTimerRef.current = window.setTimeout(() => {
+            stopPlayback();
+          }, durationMs);
+          setAudioError(null);
+        } catch (error: unknown) {
           const message = error instanceof Error ? error.message : "Unable to play audio.";
           setAudioError(message);
           stopPlayback();
-        });
-      }
+        }
+      };
 
-      stopTimerRef.current = window.setTimeout(() => {
-        stopPlayback();
-      }, durationMs);
-      setAudioError(null);
+      void startPlayback();
     },
     [audioSrc, stopPlayback],
   );
@@ -542,7 +595,7 @@ export default function DisplayPage({ title, transcript, segments }: Props) {
                     }
                   }}
                 >
-                  {isParagraphPlaying ? "◼" : "▸"}
+                  {isParagraphPlaying ? "◼" : "▶"}
                 </button>
                 <p className="display-transcript">
                   {paragraph.segments.map((segment, segmentIndex) => {

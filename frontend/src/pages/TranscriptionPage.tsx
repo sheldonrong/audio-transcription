@@ -27,6 +27,7 @@ type Props = {
 
 const DEFAULT_LANGUAGE = "auto";
 const DEFAULT_MODEL = "medium";
+const AUDIO_FILE_ACCEPT = "audio/*,.wav,.mp3,.m4a,.mp4,.aac,.ogg,.flac,.webm,.3gp,.amr,.opus,.caf";
 
 function getWsUrl(): string {
   const envUrl = import.meta.env.VITE_WS_URL as string | undefined;
@@ -67,6 +68,8 @@ export default function TranscriptionPage({
   const [selectedAudioPath, setSelectedAudioPath] = useState("");
   const [audioListLoading, setAudioListLoading] = useState(false);
   const [audioListError, setAudioListError] = useState<string | null>(null);
+  const [audioUploadLoading, setAudioUploadLoading] = useState(false);
+  const [audioUploadResult, setAudioUploadResult] = useState<string | null>(null);
   const [transcribedFileMeta, setTranscribedFileMeta] = useState<{
     filename: string;
     path: string;
@@ -78,6 +81,7 @@ export default function TranscriptionPage({
   const [exportResult, setExportResult] = useState<string | null>(null);
   const [segments, setSegments] = useState<TranscribedSegment[]>([]);
   const transcriptRef = useRef<HTMLPreElement | null>(null);
+  const uploadInputRef = useRef<HTMLInputElement | null>(null);
 
   const wsUrl = useMemo(() => getWsUrl(), []);
   const apiBaseUrl = useMemo(() => getApiBaseUrl(wsUrl), [wsUrl]);
@@ -141,6 +145,62 @@ export default function TranscriptionPage({
   useEffect(() => {
     void loadAudioLibrary();
   }, [loadAudioLibrary]);
+
+  const handleAudioUpload = useCallback(
+    async (file: File | null) => {
+      if (!file) {
+        return;
+      }
+
+      setAudioUploadLoading(true);
+      setAudioUploadResult(null);
+      setAudioListError(null);
+
+      const formData = new FormData();
+      formData.append("file", file);
+
+      try {
+        const response = await fetch(`${apiBaseUrl}/api/audios/upload`, {
+          method: "POST",
+          body: formData,
+        });
+
+        let payload: { detail?: unknown; filename?: unknown; path?: unknown } = {};
+        try {
+          payload = (await response.json()) as { detail?: unknown; filename?: unknown; path?: unknown };
+        } catch {
+          payload = {};
+        }
+
+        if (!response.ok) {
+          const message =
+            typeof payload.detail === "string" && payload.detail.trim()
+              ? payload.detail
+              : `Request failed with status ${response.status}.`;
+          throw new Error(message);
+        }
+
+        const uploadedFilename =
+          typeof payload.filename === "string" && payload.filename.trim()
+            ? payload.filename
+            : file.name;
+        const uploadedPath =
+          typeof payload.path === "string" && payload.path.trim() ? payload.path : "";
+
+        await loadAudioLibrary();
+        if (uploadedPath) {
+          setSelectedAudioPath(uploadedPath);
+        }
+        setAudioUploadResult(`Uploaded audio file: ${uploadedFilename}`);
+      } catch (uploadError) {
+        const message = uploadError instanceof Error ? uploadError.message : "Failed to upload audio file.";
+        setAudioListError(`Upload failed: ${message}`);
+      } finally {
+        setAudioUploadLoading(false);
+      }
+    },
+    [apiBaseUrl, loadAudioLibrary],
+  );
 
   const handleServerEvent = (event: ServerEvent) => {
     if (event.type === "accepted") {
@@ -344,9 +404,33 @@ export default function TranscriptionPage({
             ))}
           </select>
         </label>
-        <button type="button" className="secondary-btn" onClick={() => void loadAudioLibrary()} disabled={audioListLoading}>
+        <button
+          type="button"
+          className="secondary-btn"
+          onClick={() => void loadAudioLibrary()}
+          disabled={audioListLoading || audioUploadLoading}
+        >
           {audioListLoading ? "Refreshing..." : "Refresh"}
         </button>
+        <button
+          type="button"
+          className="secondary-btn"
+          onClick={() => uploadInputRef.current?.click()}
+          disabled={audioListLoading || audioUploadLoading}
+        >
+          {audioUploadLoading ? "Uploading..." : "Upload"}
+        </button>
+        <input
+          ref={uploadInputRef}
+          type="file"
+          accept={AUDIO_FILE_ACCEPT}
+          hidden
+          onChange={(event) => {
+            const selectedFile = event.currentTarget.files?.[0] ?? null;
+            void handleAudioUpload(selectedFile);
+            event.currentTarget.value = "";
+          }}
+        />
       </div>
 
       <div className="actions-row">
@@ -382,6 +466,7 @@ export default function TranscriptionPage({
 
       {error && <p className="error">{error}</p>}
       {exportResult && <p className="meta">{exportResult}</p>}
+      {audioUploadResult && <p className="meta">{audioUploadResult}</p>}
       {audioListError && <p className="error">{audioListError}</p>}
 
       <article className="transcript-box">

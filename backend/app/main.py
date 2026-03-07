@@ -12,7 +12,16 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    File,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
@@ -81,6 +90,21 @@ def get_unique_transcription_file_path(directory: Path, base_name: str) -> Path:
     counter = 1
     while True:
         next_candidate = directory / f"{base_name}-{counter}.tsp"
+        if not next_candidate.exists():
+            return next_candidate
+        counter += 1
+
+
+def get_unique_audio_file_path(directory: Path, filename: str) -> Path:
+    candidate = directory / filename
+    if not candidate.exists():
+        return candidate
+
+    stem = Path(filename).stem or "audio"
+    suffix = Path(filename).suffix
+    counter = 1
+    while True:
+        next_candidate = directory / f"{stem}-{counter}{suffix}"
         if not next_candidate.exists():
             return next_candidate
         counter += 1
@@ -201,6 +225,52 @@ def parse_transcription_file(archive_path: Path) -> dict:
         raise HTTPException(status_code=400, detail=f"Invalid Transcription File archive: {exc}") from exc
 
 
+def parse_byte_range(range_header: str, total_length: int) -> tuple[int, int]:
+    content_range_any = f"bytes */{total_length}"
+
+    def out_of_range(message: str) -> HTTPException:
+        return HTTPException(status_code=416, detail=message, headers={"Content-Range": content_range_any})
+
+    normalized = (range_header or "").strip()
+    if not normalized.startswith("bytes="):
+        raise out_of_range("Only byte ranges are supported.")
+
+    spec = normalized[len("bytes=") :].strip()
+    if "," in spec:
+        raise out_of_range("Multiple ranges are not supported.")
+    if "-" not in spec:
+        raise out_of_range("Invalid byte range syntax.")
+
+    start_raw, end_raw = spec.split("-", 1)
+    start_raw = start_raw.strip()
+    end_raw = end_raw.strip()
+
+    try:
+        if not start_raw:
+            if not end_raw:
+                raise out_of_range("Invalid suffix byte range.")
+            suffix_length = int(end_raw)
+            if suffix_length <= 0:
+                raise out_of_range("Invalid suffix byte range.")
+            if suffix_length >= total_length:
+                return 0, total_length - 1
+            return total_length - suffix_length, total_length - 1
+
+        start = int(start_raw)
+        if start < 0 or start >= total_length:
+            raise out_of_range("Range start is out of bounds.")
+
+        if not end_raw:
+            return start, total_length - 1
+
+        end = int(end_raw)
+        if end < start:
+            raise out_of_range("Range end precedes range start.")
+        return start, min(end, total_length - 1)
+    except ValueError as exc:
+        raise out_of_range("Invalid numeric byte range.") from exc
+
+
 @app.get("/health")
 async def health() -> dict:
     return {
@@ -230,6 +300,43 @@ async def list_audios(request: Request) -> dict:
             }
             for item in files
         ],
+    }
+
+
+@app.post("/api/audios/upload")
+async def upload_audio(request: Request, file: UploadFile = File(...)) -> dict:
+    raw_filename = (file.filename or "").strip()
+    normalized_filename = Path(raw_filename.replace("\\", "/")).name
+    if not normalized_filename:
+        raise HTTPException(status_code=400, detail="Missing upload filename.")
+
+    try:
+        payload = await file.read()
+    finally:
+        await file.close()
+
+    try:
+        validate_upload(normalized_filename, payload)
+    except UploadValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        audio_library_dir.mkdir(parents=True, exist_ok=True)
+        destination = get_unique_audio_file_path(audio_library_dir, normalized_filename)
+        destination.write_bytes(payload)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to write uploaded audio file to AUDIO_DIR: {exc}",
+        ) from exc
+
+    relative_path = destination.relative_to(audio_library_dir).as_posix()
+    base_url = str(request.base_url).rstrip("/")
+    return {
+        "filename": destination.name,
+        "path": relative_path,
+        "size_bytes": len(payload),
+        "url": f"{base_url}/audios/{quote(relative_path, safe='/')}",
     }
 
 
@@ -285,7 +392,11 @@ async def load_transcription_file(
 
 
 @app.get("/api/exports/{transcription_filename}/audio")
-async def stream_transcription_file_audio(transcription_filename: str, member: str) -> Response:
+async def stream_transcription_file_audio(
+    transcription_filename: str,
+    member: str,
+    request: Request,
+) -> Response:
     archive_path = resolve_output_transcription_file_path(transcription_filename)
     member_name = (member or "").strip()
     if not member_name:
@@ -303,7 +414,24 @@ async def stream_transcription_file_audio(transcription_filename: str, member: s
         raise HTTPException(status_code=400, detail=f"Invalid Transcription File archive: {exc}") from exc
 
     media_type = mimetypes.guess_type(member_name)[0] or "application/octet-stream"
-    return Response(content=payload, media_type=media_type)
+    total_length = len(payload)
+    range_header = request.headers.get("range")
+    default_headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(total_length),
+    }
+
+    if not range_header:
+        return Response(content=payload, media_type=media_type, headers=default_headers)
+
+    start, end = parse_byte_range(range_header, total_length)
+    chunk = payload[start : end + 1]
+    partial_headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Range": f"bytes {start}-{end}/{total_length}",
+        "Content-Length": str(len(chunk)),
+    }
+    return Response(content=chunk, media_type=media_type, headers=partial_headers, status_code=206)
 
 
 @app.post(
