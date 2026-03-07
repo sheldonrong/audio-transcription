@@ -10,6 +10,7 @@ FROM rocm/pytorch:latest-release AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    OMP_NUM_THREADS=8 \
     AUDIO_DIR=/audios \
     OUTPUT_DIR=/output \
     WHISPER_DEVICE=rocm \

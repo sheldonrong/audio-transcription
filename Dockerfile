@@ -10,6 +10,7 @@ FROM python:3.10-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    OMP_NUM_THREADS=8 \
     AUDIO_DIR=/audios \
     OUTPUT_DIR=/output
 
