@@ -45,18 +45,23 @@ from app.transcribe import (
     DEFAULT_COMPUTE_TYPE,
     DEFAULT_DEVICE,
     DEFAULT_MODEL,
+    MAX_UPLOAD_MB,
     MAX_UPLOAD_BYTES,
     ModelManager,
     SegmentResult,
     TranscriptionError,
     TranscriptionInfo,
     UploadValidationError,
+    get_upload_limit_message,
     get_audio_library_dir,
     get_output_dir,
     list_audio_library_files,
     load_audio_from_library,
+    resolve_audio_library_file,
     transcribe_audio,
     validate_upload,
+    validate_upload_extension,
+    validate_upload_size,
 )
 
 app = FastAPI(title="Live Transcription API", version="1.0.0")
@@ -279,7 +284,7 @@ async def health() -> dict:
             "model": DEFAULT_MODEL,
             "device": DEFAULT_DEVICE,
             "compute_type": DEFAULT_COMPUTE_TYPE,
-            "max_upload_mb": MAX_UPLOAD_BYTES // (1024 * 1024),
+            "max_upload_mb": MAX_UPLOAD_MB,
         },
     }
 
@@ -311,31 +316,48 @@ async def upload_audio(request: Request, file: UploadFile = File(...)) -> dict:
         raise HTTPException(status_code=400, detail="Missing upload filename.")
 
     try:
-        payload = await file.read()
-    finally:
-        await file.close()
-
-    try:
-        validate_upload(normalized_filename, payload)
+        validate_upload_extension(normalized_filename)
     except UploadValidationError as exc:
+        await file.close()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    destination: Optional[Path] = None
+    size_bytes = 0
 
     try:
         audio_library_dir.mkdir(parents=True, exist_ok=True)
         destination = get_unique_audio_file_path(audio_library_dir, normalized_filename)
-        destination.write_bytes(payload)
+        with destination.open("wb") as output_stream:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                next_size = size_bytes + len(chunk)
+                if next_size > MAX_UPLOAD_BYTES:
+                    raise UploadValidationError(get_upload_limit_message())
+                output_stream.write(chunk)
+                size_bytes = next_size
+        validate_upload_size(size_bytes)
+    except UploadValidationError as exc:
+        if destination and destination.exists():
+            destination.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except OSError as exc:
+        if destination and destination.exists():
+            destination.unlink(missing_ok=True)
         raise HTTPException(
             status_code=500,
             detail=f"Failed to write uploaded audio file to AUDIO_DIR: {exc}",
         ) from exc
+    finally:
+        await file.close()
 
     relative_path = destination.relative_to(audio_library_dir).as_posix()
     base_url = str(request.base_url).rstrip("/")
     return {
         "filename": destination.name,
         "path": relative_path,
-        "size_bytes": len(payload),
+        "size_bytes": size_bytes,
         "url": f"{base_url}/audios/{quote(relative_path, safe='/')}",
     }
 
@@ -526,7 +548,7 @@ async def receive_audio_payload(websocket: WebSocket) -> bytes:
             chunk = message["bytes"]
             buffer.extend(chunk)
             if len(buffer) > MAX_UPLOAD_BYTES:
-                raise UploadValidationError("Uploaded file exceeds the 50 MB limit.")
+                raise UploadValidationError(get_upload_limit_message())
             continue
 
         text = message.get("text")
@@ -540,10 +562,22 @@ async def receive_audio_payload(websocket: WebSocket) -> bytes:
     return bytes(buffer)
 
 
+async def watch_for_disconnect(websocket: WebSocket, cancel_event: threading.Event) -> None:
+    try:
+        while True:
+            message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                cancel_event.set()
+                return
+    except RuntimeError:
+        cancel_event.set()
+
+
 async def iter_transcription_events(
-    audio_bytes: bytes,
+    audio_source: bytes | str,
     model_name: str,
     language: Optional[str],
+    cancel_event: threading.Event,
 ):
     queue: asyncio.Queue[object] = asyncio.Queue()
     sentinel = object()
@@ -553,10 +587,13 @@ async def iter_transcription_events(
         try:
             for item in transcribe_audio(
                 model_manager=model_manager,
-                audio_bytes=audio_bytes,
+                audio_source=audio_source,
                 model_name=model_name,
                 language=language,
+                cancel_event=cancel_event,
             ):
+                if cancel_event.is_set():
+                    break
                 loop.call_soon_threadsafe(queue.put_nowait, item)
         except Exception as exc:  # noqa: BLE001
             loop.call_soon_threadsafe(queue.put_nowait, exc)
@@ -566,7 +603,12 @@ async def iter_transcription_events(
     threading.Thread(target=worker, daemon=True).start()
 
     while True:
-        item = await queue.get()
+        if cancel_event.is_set() and queue.empty():
+            break
+        try:
+            item = await asyncio.wait_for(queue.get(), timeout=0.2)
+        except asyncio.TimeoutError:
+            continue
         if item is sentinel:
             break
         if isinstance(item, Exception):
@@ -579,6 +621,8 @@ async def ws_transcribe(websocket: WebSocket) -> None:
     await websocket.accept()
 
     job_id = str(uuid.uuid4())
+    cancel_event = threading.Event()
+    disconnect_task: Optional[asyncio.Task[None]] = None
 
     try:
         try:
@@ -592,22 +636,24 @@ async def ws_transcribe(websocket: WebSocket) -> None:
         )
 
         if start.audio_path:
-            resolved_filename, audio_bytes = load_audio_from_library(
-                start.audio_path, audio_library_dir
-            )
-            validate_upload(resolved_filename, audio_bytes)
+            resolved_path = resolve_audio_library_file(start.audio_path, audio_library_dir)
+            resolved_filename = resolved_path.name
+            audio_source: bytes | str = str(resolved_path)
         else:
             audio_bytes = await receive_audio_payload(websocket)
             validate_upload(start.filename, audio_bytes)
+            audio_source = audio_bytes
 
+        disconnect_task = asyncio.create_task(watch_for_disconnect(websocket, cancel_event))
         accumulated_text_parts: list[str] = []
         total_duration: Optional[float] = None
         segment_count = 0
 
         async for item in iter_transcription_events(
-            audio_bytes=audio_bytes,
+            audio_source=audio_source,
             model_name=start.model or DEFAULT_MODEL,
             language=start.language,
+            cancel_event=cancel_event,
         ):
             if isinstance(item, TranscriptionInfo):
                 total_duration = item.duration
@@ -653,6 +699,9 @@ async def ws_transcribe(websocket: WebSocket) -> None:
                 )
                 await asyncio.sleep(0)
 
+        if cancel_event.is_set():
+            return
+
         await websocket.send_json(
             CompleteEvent(
                 job_id=job_id,
@@ -668,9 +717,17 @@ async def ws_transcribe(websocket: WebSocket) -> None:
     except TranscriptionError as exc:
         await send_error_and_close(websocket, job_id, str(exc), 1011)
     except WebSocketDisconnect:
+        cancel_event.set()
         return
     except Exception as exc:  # noqa: BLE001
         await send_error_and_close(websocket, job_id, f"Unexpected server error: {exc}", 1011)
+    finally:
+        if disconnect_task:
+            disconnect_task.cancel()
+            try:
+                await disconnect_task
+            except asyncio.CancelledError:
+                pass
 
 
 if frontend_dist_dir.exists():

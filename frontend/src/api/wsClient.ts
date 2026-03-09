@@ -40,7 +40,11 @@ export class TranscriptionWsClient {
     this.socket.send("__end__");
   }
 
-  close(): void {
+  close(code?: number, reason?: string): void {
+    if (code !== undefined) {
+      this.socket.close(code, reason);
+      return;
+    }
     this.socket.close();
   }
 

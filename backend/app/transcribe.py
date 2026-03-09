@@ -10,7 +10,8 @@ from typing import Optional
 from faster_whisper import WhisperModel
 
 DEFAULT_MODEL = "medium"
-MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+MAX_UPLOAD_BYTES = 1024 * 1024 * 1024
+MAX_UPLOAD_MB = MAX_UPLOAD_BYTES // (1024 * 1024)
 ALLOWED_EXTENSIONS = {
     ".wav",
     ".mp3",
@@ -29,6 +30,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_AUDIO_DIR = Path("/audios")
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output"
 SUPPORTED_DEVICES = {"cpu", "cuda", "rocm"}
+
+
+def get_upload_limit_message() -> str:
+    return f"Uploaded file exceeds the {MAX_UPLOAD_MB} MB limit."
 
 
 def _read_env_setting(name: str) -> Optional[str]:
@@ -155,16 +160,46 @@ class ModelManager:
 
 
 def validate_upload(filename: str, payload: bytes) -> None:
-    if not payload:
-        raise UploadValidationError("Uploaded file is empty.")
-    if len(payload) > MAX_UPLOAD_BYTES:
-        raise UploadValidationError("Uploaded file exceeds the 50 MB limit.")
+    validate_upload_size(len(payload))
+    validate_upload_extension(filename)
 
+
+def validate_upload_size(size_bytes: int) -> None:
+    if size_bytes <= 0:
+        raise UploadValidationError("Uploaded file is empty.")
+    if size_bytes > MAX_UPLOAD_BYTES:
+        raise UploadValidationError(get_upload_limit_message())
+
+
+def validate_upload_extension(filename: str) -> None:
     lowered = filename.lower()
     if not any(lowered.endswith(ext) for ext in ALLOWED_EXTENSIONS):
         raise UploadValidationError(
             "Unsupported file extension. Allowed: " + ", ".join(sorted(ALLOWED_EXTENSIONS))
         )
+
+
+def resolve_audio_library_file(audio_path: str, audio_dir: Optional[Path] = None) -> Path:
+    normalized_path = (audio_path or "").strip()
+    if not normalized_path:
+        raise UploadValidationError("Missing audio path.")
+
+    directory = (audio_dir or get_audio_library_dir()).resolve()
+    if not directory.exists() or not directory.is_dir():
+        raise UploadValidationError(f"Audio directory not found: {directory}")
+
+    candidate = (directory / normalized_path).resolve()
+    try:
+        candidate.relative_to(directory)
+    except ValueError as exc:
+        raise UploadValidationError("Invalid audio path outside /audios directory.") from exc
+
+    if not candidate.is_file():
+        raise UploadValidationError(f"Audio file not found in /audios: {normalized_path}")
+
+    validate_upload_extension(candidate.name)
+    validate_upload_size(candidate.stat().st_size)
+    return candidate
 
 
 def get_audio_library_dir() -> Path:
@@ -219,23 +254,7 @@ def list_audio_library_files(audio_dir: Optional[Path] = None) -> list[AudioLibr
 
 
 def load_audio_from_library(audio_path: str, audio_dir: Optional[Path] = None) -> tuple[str, bytes]:
-    normalized_path = (audio_path or "").strip()
-    if not normalized_path:
-        raise UploadValidationError("Missing audio path.")
-
-    directory = (audio_dir or get_audio_library_dir()).resolve()
-    if not directory.exists() or not directory.is_dir():
-        raise UploadValidationError(f"Audio directory not found: {directory}")
-
-    candidate = (directory / normalized_path).resolve()
-    try:
-        candidate.relative_to(directory)
-    except ValueError as exc:
-        raise UploadValidationError("Invalid audio path outside /audios directory.") from exc
-
-    if not candidate.is_file():
-        raise UploadValidationError(f"Audio file not found in /audios: {normalized_path}")
-
+    candidate = resolve_audio_library_file(audio_path, audio_dir)
     payload = candidate.read_bytes()
     validate_upload(candidate.name, payload)
     return candidate.name, payload
@@ -243,18 +262,19 @@ def load_audio_from_library(audio_path: str, audio_dir: Optional[Path] = None) -
 
 def transcribe_audio(
     model_manager: ModelManager,
-    audio_bytes: bytes,
+    audio_source: bytes | str | Path,
     model_name: str,
     language: Optional[str],
+    cancel_event: Optional[threading.Event] = None,
 ):
     model = model_manager.get(model_name)
-    audio_stream = io.BytesIO(audio_bytes)
+    audio_input = io.BytesIO(audio_source) if isinstance(audio_source, bytes) else str(audio_source)
 
     whisper_language = None if language in (None, "", "auto") else language
 
     try:
         segments, info = model.transcribe(
-            audio_stream,
+            audio_input,
             language=whisper_language,
             vad_filter=True,
             condition_on_previous_text=True,
@@ -266,6 +286,8 @@ def transcribe_audio(
     yield TranscriptionInfo(duration=duration)
 
     for idx, segment in enumerate(segments):
+        if cancel_event and cancel_event.is_set():
+            return
         yield SegmentResult(
             index=idx,
             start=float(getattr(segment, "start", 0.0)),

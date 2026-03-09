@@ -137,7 +137,7 @@ Server streams events:
 - You can pass `WHISPER_HSA_OVERRIDE_GFX_VERSION` (maps to `HSA_OVERRIDE_GFX_VERSION`) as an unofficial workaround for legacy cards where ROCm detection fails
 - You can pass `WHISPER_ROCR_VISIBLE_DEVICES` (maps to `ROCR_VISIBLE_DEVICES`) to pin one AMD GPU
 - ROCm compatibility is hardware-dependent; current ROCm docs mark `gfx900` unsupported and `gfx906` deprecated, which affects Vega-class GPUs
-- Max upload size: `50 MB`
+- Max upload size: `1024 MB`
 - You can set `AUDIO_DIR` to override the audio library folder path
 - You can set `OUTPUT_DIR` to control where Transcription Files are stored
 - Allowed origins include `http://localhost:5173`

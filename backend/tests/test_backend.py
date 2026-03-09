@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import zipfile
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from fastapi.testclient import TestClient
 from app.main import app
 from app.transcribe import (
     AudioLibraryFile,
+    MAX_UPLOAD_MB,
     MAX_UPLOAD_BYTES,
     ModelManager,
     SegmentResult,
@@ -20,6 +22,7 @@ from app.transcribe import (
     get_runtime_device,
     is_cpu_device,
     normalize_device,
+    transcribe_audio,
     validate_upload,
 )
 
@@ -30,7 +33,7 @@ def test_validate_upload_size_limit() -> None:
         validate_upload("sample.wav", too_large)
         assert False, "Expected size validation error"
     except Exception as exc:  # noqa: BLE001
-        assert "50 MB" in str(exc)
+        assert f"{MAX_UPLOAD_MB} MB" in str(exc)
 
 
 def test_validate_upload_extension() -> None:
@@ -48,6 +51,39 @@ def test_validate_upload_mobile_memo_extensions() -> None:
     validate_upload("voice-note.opus", b"abc")
 
 
+def test_transcribe_audio_respects_cancel_event() -> None:
+    class FakeSegment:
+        start = 0.0
+        end = 1.0
+        text = "hello"
+
+    class FakeInfo:
+        duration = 12.0
+
+    class FakeModel:
+        def transcribe(self, *_args, **_kwargs):
+            return [FakeSegment()], FakeInfo()
+
+    class FakeManager:
+        def get(self, _model_name: str):
+            return FakeModel()
+
+    cancel_event = threading.Event()
+    events = transcribe_audio(
+        model_manager=FakeManager(),  # type: ignore[arg-type]
+        audio_source=b"fake audio",
+        model_name="medium",
+        language="en",
+        cancel_event=cancel_event,
+    )
+
+    first_event = next(events)
+    assert isinstance(first_event, TranscriptionInfo)
+
+    cancel_event.set()
+    assert list(events) == []
+
+
 def test_health_endpoint() -> None:
     client = TestClient(app)
     response = client.get("/health")
@@ -55,6 +91,7 @@ def test_health_endpoint() -> None:
     data = response.json()
     assert data["status"] == "ok"
     assert data["defaults"]["model"] == "medium"
+    assert data["defaults"]["max_upload_mb"] == MAX_UPLOAD_MB
 
 
 def test_cpu_compute_type_defaults_to_int8() -> None:

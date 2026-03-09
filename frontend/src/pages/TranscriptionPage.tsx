@@ -8,6 +8,7 @@ type UiStatus =
   | "connecting"
   | "processing"
   | "complete"
+  | "aborted"
   | "error";
 
 type TranscribedSegment = {
@@ -23,6 +24,12 @@ type Props = {
   onTitleChange: (value: string) => void;
   onTranscriptChange: (value: string) => void;
   onSegmentsChange: (segments: TranscribedSegment[]) => void;
+};
+
+type UploadAudioResponse = {
+  detail?: unknown;
+  filename?: unknown;
+  path?: unknown;
 };
 
 const DEFAULT_LANGUAGE = "auto";
@@ -54,6 +61,59 @@ function formatFileSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function uploadAudioFile(
+  apiBaseUrl: string,
+  file: File,
+  onProgress: (percent: number | null) => void,
+): Promise<UploadAudioResponse> {
+  return new Promise((resolve, reject) => {
+    const formData = new FormData();
+    formData.append("file", file);
+
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${apiBaseUrl}/api/audios/upload`);
+
+    xhr.upload.onprogress = (event) => {
+      if (!event.lengthComputable || event.total <= 0) {
+        onProgress(null);
+        return;
+      }
+      onProgress((event.loaded / event.total) * 100);
+    };
+
+    xhr.onerror = () => {
+      reject(new Error("Network error while uploading audio file."));
+    };
+
+    xhr.onabort = () => {
+      reject(new Error("Audio upload was cancelled."));
+    };
+
+    xhr.onload = () => {
+      let payload: UploadAudioResponse = {};
+      try {
+        payload = JSON.parse(xhr.responseText) as UploadAudioResponse;
+      } catch {
+        payload = {};
+      }
+
+      if (xhr.status >= 200 && xhr.status < 300) {
+        onProgress(100);
+        resolve(payload);
+        return;
+      }
+
+      const message =
+        typeof payload.detail === "string" && payload.detail.trim()
+          ? payload.detail
+          : `Request failed with status ${xhr.status}.`;
+      reject(new Error(message));
+    };
+
+    xhr.send(formData);
+  });
+}
+
 export default function TranscriptionPage({
   title,
   transcript,
@@ -69,6 +129,7 @@ export default function TranscriptionPage({
   const [audioListLoading, setAudioListLoading] = useState(false);
   const [audioListError, setAudioListError] = useState<string | null>(null);
   const [audioUploadLoading, setAudioUploadLoading] = useState(false);
+  const [audioUploadProgress, setAudioUploadProgress] = useState<number | null>(null);
   const [audioUploadResult, setAudioUploadResult] = useState<string | null>(null);
   const [transcribedFileMeta, setTranscribedFileMeta] = useState<{
     filename: string;
@@ -82,6 +143,8 @@ export default function TranscriptionPage({
   const [segments, setSegments] = useState<TranscribedSegment[]>([]);
   const transcriptRef = useRef<HTMLPreElement | null>(null);
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
+  const activeClientRef = useRef<TranscriptionWsClient | null>(null);
+  const abortRequestedRef = useRef(false);
 
   const wsUrl = useMemo(() => getWsUrl(), []);
   const apiBaseUrl = useMemo(() => getApiBaseUrl(wsUrl), [wsUrl]);
@@ -100,6 +163,13 @@ export default function TranscriptionPage({
     }
     transcriptRef.current.scrollTop = transcriptRef.current.scrollHeight;
   }, [transcript]);
+
+  useEffect(() => {
+    return () => {
+      activeClientRef.current?.close(4000, "Transcription aborted by user");
+      activeClientRef.current = null;
+    };
+  }, []);
 
   const loadAudioLibrary = useCallback(async () => {
     setAudioListLoading(true);
@@ -153,32 +223,12 @@ export default function TranscriptionPage({
       }
 
       setAudioUploadLoading(true);
+      setAudioUploadProgress(0);
       setAudioUploadResult(null);
       setAudioListError(null);
 
-      const formData = new FormData();
-      formData.append("file", file);
-
       try {
-        const response = await fetch(`${apiBaseUrl}/api/audios/upload`, {
-          method: "POST",
-          body: formData,
-        });
-
-        let payload: { detail?: unknown; filename?: unknown; path?: unknown } = {};
-        try {
-          payload = (await response.json()) as { detail?: unknown; filename?: unknown; path?: unknown };
-        } catch {
-          payload = {};
-        }
-
-        if (!response.ok) {
-          const message =
-            typeof payload.detail === "string" && payload.detail.trim()
-              ? payload.detail
-              : `Request failed with status ${response.status}.`;
-          throw new Error(message);
-        }
+        const payload = await uploadAudioFile(apiBaseUrl, file, setAudioUploadProgress);
 
         const uploadedFilename =
           typeof payload.filename === "string" && payload.filename.trim()
@@ -193,6 +243,7 @@ export default function TranscriptionPage({
         }
         setAudioUploadResult(`Uploaded audio file: ${uploadedFilename}`);
       } catch (uploadError) {
+        setAudioUploadProgress(null);
         const message = uploadError instanceof Error ? uploadError.message : "Failed to upload audio file.";
         setAudioListError(`Upload failed: ${message}`);
       } finally {
@@ -203,6 +254,10 @@ export default function TranscriptionPage({
   );
 
   const handleServerEvent = (event: ServerEvent) => {
+    if (abortRequestedRef.current) {
+      return;
+    }
+
     if (event.type === "accepted") {
       setStatus("processing");
       return;
@@ -251,6 +306,14 @@ export default function TranscriptionPage({
     }
   };
 
+  const handleAbort = () => {
+    abortRequestedRef.current = true;
+    activeClientRef.current?.close(4000, "Transcription aborted by user");
+    activeClientRef.current = null;
+    setStatus("aborted");
+    setError(null);
+  };
+
   const handleStart = () => {
     if (!title.trim()) {
       setStatus("error");
@@ -264,7 +327,9 @@ export default function TranscriptionPage({
       return;
     }
 
+    activeClientRef.current?.close(4000, "Transcription aborted by user");
     setStatus("connecting");
+    abortRequestedRef.current = false;
     setError(null);
     setExportResult(null);
     onTranscriptChange("");
@@ -295,13 +360,22 @@ export default function TranscriptionPage({
       },
       onEvent: handleServerEvent,
       onClose: () => {
+        activeClientRef.current = null;
+        if (abortRequestedRef.current) {
+          setStatus("aborted");
+          return;
+        }
         setStatus((prev) => (prev === "processing" ? "complete" : prev));
       },
       onError: () => {
+        if (abortRequestedRef.current) {
+          return;
+        }
         setStatus("error");
         setError("WebSocket connection failed.");
       },
     });
+    activeClientRef.current = client;
   };
 
   const handleSaveTranscriptionFile = async () => {
@@ -433,6 +507,21 @@ export default function TranscriptionPage({
         />
       </div>
 
+      {(audioUploadLoading || audioUploadProgress !== null) && (
+        <>
+          <div className="progress-wrap">
+            <div className="progress-bar" style={{ width: `${audioUploadProgress ?? 0}%` }} />
+          </div>
+          <p className="meta">
+            {audioUploadLoading
+              ? audioUploadProgress === null
+                ? "Uploading audio..."
+                : `Upload progress: ${audioUploadProgress.toFixed(1)}%`
+              : "Upload complete."}
+          </p>
+        </>
+      )}
+
       <div className="actions-row">
         <button
           className="start-btn"
@@ -450,6 +539,13 @@ export default function TranscriptionPage({
         >
           Save
         </button>
+        <button
+          className="secondary-btn"
+          disabled={status !== "connecting" && status !== "processing"}
+          onClick={handleAbort}
+        >
+          Stop
+        </button>
       </div>
 
       <div className="status-row">
@@ -461,7 +557,13 @@ export default function TranscriptionPage({
         <div className="progress-bar" style={{ width: `${progress ?? 5}%` }} />
       </div>
       <p className="meta">
-        {status === "idle" ? "Ready to transcribe." : progress === null ? "Processing..." : `Progress: ${progress.toFixed(1)}%`}
+        {status === "idle"
+          ? "Ready to transcribe."
+          : status === "aborted"
+            ? "Transcription aborted."
+            : progress === null
+              ? "Processing..."
+              : `Progress: ${progress.toFixed(1)}%`}
       </p>
 
       {error && <p className="error">{error}</p>}
