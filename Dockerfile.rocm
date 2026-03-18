@@ -36,6 +36,7 @@ RUN apt-get update \
         ffmpeg \
         git \
         libgomp1 \
+        libomp-dev \
         libjpeg-dev \
         libomp5 \
         pybind11-dev \
@@ -45,6 +46,10 @@ RUN apt-get update \
         python-is-python3 \
         wget \
     && rm -rf /var/lib/apt/lists/*
+
+RUN if [ -e /usr/lib/x86_64-linux-gnu/libomp.so.5 ] && [ ! -e /usr/lib/x86_64-linux-gnu/libomp.so ]; then \
+        ln -s /usr/lib/x86_64-linux-gnu/libomp.so.5 /usr/lib/x86_64-linux-gnu/libomp.so; \
+    fi
 
 RUN ${PYTHON_BIN} -m pip install --break-system-packages --no-cache-dir wheel setuptools
 
