@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { VideoConversionWsClient } from "../api/wsClient";
+import { getApiBaseUrl, getV2AWsUrl } from "../config";
 import type { VideoConversionServerEvent } from "../types/events";
 
 type UiStatus = "idle" | "connecting" | "converting" | "complete" | "aborted" | "error";
@@ -17,40 +18,6 @@ type ConversionResult = {
   path: string;
   url: string;
 };
-
-function getWsUrl(): string {
-  const dedicatedUrl = import.meta.env.VITE_V2A_WS_URL as string | undefined;
-  if (dedicatedUrl) return dedicatedUrl;
-
-  const sharedUrl = import.meta.env.VITE_WS_URL as string | undefined;
-  if (sharedUrl) {
-    if (/\/ws\/transcribe\/?$/.test(sharedUrl)) {
-      return sharedUrl.replace(/\/ws\/transcribe\/?$/, "/ws/v2a");
-    }
-
-    try {
-      const parsed = new URL(sharedUrl);
-      return `${parsed.protocol}//${parsed.host}/ws/v2a`;
-    } catch {
-      return sharedUrl;
-    }
-  }
-
-  return "ws://localhost:8000/ws/v2a";
-}
-
-function getApiBaseUrl(wsUrl: string): string {
-  const envUrl = import.meta.env.VITE_API_BASE_URL as string | undefined;
-  if (envUrl) return envUrl.replace(/\/+$/, "");
-
-  try {
-    const parsed = new URL(wsUrl);
-    const protocol = parsed.protocol === "wss:" ? "https:" : "http:";
-    return `${protocol}//${parsed.host}`;
-  } catch {
-    return "http://localhost:8000";
-  }
-}
 
 function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -84,8 +51,8 @@ export default function V2APage() {
   const activeClientRef = useRef<VideoConversionWsClient | null>(null);
   const abortRequestedRef = useRef(false);
 
-  const wsUrl = useMemo(() => getWsUrl(), []);
-  const apiBaseUrl = useMemo(() => getApiBaseUrl(wsUrl), [wsUrl]);
+  const wsUrl = useMemo(() => getV2AWsUrl(), []);
+  const apiBaseUrl = useMemo(() => getApiBaseUrl(), []);
   const selectedVideo = useMemo(
     () => videoFiles.find((entry) => entry.path === selectedVideoPath) ?? null,
     [selectedVideoPath, videoFiles],

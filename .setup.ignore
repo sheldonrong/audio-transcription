@@ -1,0 +1,2 @@
+sudo docker image build -t audio_transcrition:cuda --build-arg VITE_API_BASE_URL=http://192.168.0.117:8888 --build-arg VITE_WS_URL=http://192.168.0.117:8888 --build-arg OMP_NUM_THREADS=8 --build-arg WHISPER_DEVICE=cpu --build-arg OUTPUT_DIR=/output --build-arg AUDIO_DIR=/audios -f ./Dockerfile .
+sudo docker run -d -p 8888:8000 --mount type=bind,src=/mnt/Storage/Storage/Pastebin,dst=/audios --mount type=bind,src=/mnt/Storage/Storage/AudioTranscription,dst=/output audio_transcrition:cuda

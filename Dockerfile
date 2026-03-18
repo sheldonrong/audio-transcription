@@ -1,10 +1,5 @@
 FROM node:20-alpine AS frontend-builder
 
-ARG VITE_API_BASE_URL
-ARG VITE_WS_URL
-ENV VITE_API_BASE_URL=${VITE_API_BASE_URL}
-ENV VITE_WS_URL=${VITE_WS_URL}
-
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
 RUN npm ci
@@ -30,11 +25,14 @@ RUN pip install --no-cache-dir -r /app/backend/requirements.txt
 
 COPY backend /app/backend
 COPY --from=frontend-builder /app/frontend/dist /app/frontend/dist
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 
 RUN mkdir -p /audios /output
+RUN chmod +x /app/docker-entrypoint.sh
 
 WORKDIR /app/backend
 
 EXPOSE 8000
 
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

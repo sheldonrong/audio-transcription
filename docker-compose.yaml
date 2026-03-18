@@ -1,15 +1,14 @@
 services:
-  auto-transcript-rocm:
+  audio-transcript:
     # build:
     #   context: .
-    #   dockerfile: /home/admin/audio-transcription/Dockerfile.rocm
-    #   args:
-    #     VITE_API_BASE_URL: http://192.168.0.117:8888
-    #     VITE_WS_URL: ws://192.168.0.117:8888
+    #   dockerfile: Dockerfile.rocm
     image: audio-transcript-rocm
     ports:
       - "8888:8000"
     environment:
+      API_BASE_URL: http://192.168.0.117:8888
+      WS_URL: ws://192.168.0.117:8888
       AUDIO_DIR: /audios
       OUTPUT_DIR: /output
       WHISPER_DEVICE: rocm
@@ -20,6 +19,6 @@ services:
     group_add:
       - video
     volumes:
-      - ./mnt/Storage/Storage/Pastebin:/audios
-      - ./mnt/Storage/Storage/AudioTranscription:/output
+      - /mnt/Storage/Storage/Pastebin:/audios
+      - /mnt/Storage/Storage/AudioTranscription:/output
     restart: unless-stopped

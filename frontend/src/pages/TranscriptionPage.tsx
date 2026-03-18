@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { TranscriptionWsClient } from "../api/wsClient";
+import { getApiBaseUrl, getTranscriptionWsUrl } from "../config";
 import type { ServerEvent } from "../types/events";
 
 type UiStatus =
@@ -35,25 +36,6 @@ type UploadAudioResponse = {
 const DEFAULT_LANGUAGE = "auto";
 const DEFAULT_MODEL = "medium";
 const AUDIO_FILE_ACCEPT = "audio/*,.wav,.mp3,.m4a,.mp4,.aac,.ogg,.flac,.webm,.3gp,.amr,.opus,.caf";
-
-function getWsUrl(): string {
-  const envUrl = import.meta.env.VITE_WS_URL as string | undefined;
-  if (envUrl) return envUrl;
-  return "ws://localhost:8000/ws/transcribe";
-}
-
-function getApiBaseUrl(wsUrl: string): string {
-  const envUrl = import.meta.env.VITE_API_BASE_URL as string | undefined;
-  if (envUrl) return envUrl.replace(/\/+$/, "");
-
-  try {
-    const parsed = new URL(wsUrl);
-    const protocol = parsed.protocol === "wss:" ? "https:" : "http:";
-    return `${protocol}//${parsed.host}`;
-  } catch {
-    return "http://localhost:8000";
-  }
-}
 
 function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -146,8 +128,8 @@ export default function TranscriptionPage({
   const activeClientRef = useRef<TranscriptionWsClient | null>(null);
   const abortRequestedRef = useRef(false);
 
-  const wsUrl = useMemo(() => getWsUrl(), []);
-  const apiBaseUrl = useMemo(() => getApiBaseUrl(wsUrl), [wsUrl]);
+  const wsUrl = useMemo(() => getTranscriptionWsUrl(), []);
+  const apiBaseUrl = useMemo(() => getApiBaseUrl(), []);
   const selectedAudio = useMemo(
     () => audioFiles.find((file) => file.path === selectedAudioPath) ?? null,
     [audioFiles, selectedAudioPath],

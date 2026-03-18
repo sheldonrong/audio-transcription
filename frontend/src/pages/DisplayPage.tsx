@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { getApiBaseUrl } from "../config";
+
 type Props = {
   title: string;
   transcript: string;
@@ -73,12 +75,6 @@ function groupSegmentsIntoParagraphs(segments: SegmentView[], segmentsPerParagra
     });
   }
   return paragraphs;
-}
-
-function getApiBaseUrl(): string {
-  const envUrl = import.meta.env.VITE_API_BASE_URL as string | undefined;
-  if (envUrl) return envUrl.replace(/\/+$/, "");
-  return "http://localhost:8000";
 }
 
 function formatFileSize(bytes: number): string {
