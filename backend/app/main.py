@@ -4,9 +4,11 @@ import asyncio
 import json
 import mimetypes
 import re
+import subprocess
 import threading
 import uuid
 import zipfile
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -39,6 +41,9 @@ from app.schemas import (
     ProgressEvent,
     SegmentEvent,
     StartMessage,
+    VideoConversionCompleteEvent,
+    VideoConversionProgressEvent,
+    VideoConversionStartMessage,
 )
 from app.transcribe import (
     ALLOWED_EXTENSIONS,
@@ -56,8 +61,10 @@ from app.transcribe import (
     get_audio_library_dir,
     get_output_dir,
     list_audio_library_files,
+    list_video_library_files,
     load_audio_from_library,
     resolve_audio_library_file,
+    resolve_video_library_file,
     transcribe_audio,
     validate_upload,
     validate_upload_extension,
@@ -101,18 +108,204 @@ def get_unique_transcription_file_path(directory: Path, base_name: str) -> Path:
 
 
 def get_unique_audio_file_path(directory: Path, filename: str) -> Path:
-    candidate = directory / filename
+    normalized = Path(filename)
+    candidate = directory / normalized
     if not candidate.exists():
+        candidate.parent.mkdir(parents=True, exist_ok=True)
         return candidate
 
-    stem = Path(filename).stem or "audio"
-    suffix = Path(filename).suffix
+    stem = normalized.stem or "audio"
+    suffix = normalized.suffix
+    parent = normalized.parent
     counter = 1
     while True:
-        next_candidate = directory / f"{stem}-{counter}{suffix}"
+        next_candidate = directory / parent / f"{stem}-{counter}{suffix}"
         if not next_candidate.exists():
+            next_candidate.parent.mkdir(parents=True, exist_ok=True)
             return next_candidate
         counter += 1
+
+
+def format_audio_output_filename(video_filename: str) -> str:
+    normalized = Path(video_filename)
+    stem = normalized.stem or "converted-audio"
+    return (normalized.parent / f"{stem}.m4a").as_posix()
+
+
+def parse_ffmpeg_out_time(value: str) -> Optional[float]:
+    normalized = (value or "").strip()
+    if not normalized:
+        return None
+
+    if ":" in normalized:
+        parts = normalized.split(":")
+        if len(parts) != 3:
+            return None
+        try:
+            hours = int(parts[0])
+            minutes = int(parts[1])
+            seconds = float(parts[2])
+        except ValueError:
+            return None
+        return (hours * 3600) + (minutes * 60) + seconds
+
+    try:
+        # ffmpeg progress output reports these fields in microseconds despite the `ms` key name.
+        return float(normalized) / 1_000_000.0
+    except ValueError:
+        return None
+
+
+def probe_media_duration(video_path: Path) -> Optional[float]:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(video_path),
+            ],
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise TranscriptionError("ffprobe is not installed or not available on PATH.") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.strip() or exc.stdout.strip() or str(exc)
+        raise TranscriptionError(f"Failed to inspect uploaded video with ffprobe: {detail}") from exc
+
+    raw_duration = result.stdout.strip()
+    if not raw_duration:
+        return None
+
+    try:
+        parsed = float(raw_duration)
+    except ValueError:
+        return None
+
+    return parsed if parsed > 0 else None
+
+
+@dataclass
+class VideoConversionProgress:
+    processed_seconds: float
+    total_estimated_seconds: Optional[float]
+    percent: Optional[float]
+
+
+def convert_video_to_audio(
+    video_path: Path,
+    output_path: Path,
+    total_duration: Optional[float],
+    cancel_event: threading.Event,
+):
+    try:
+        process = subprocess.Popen(
+            [
+                "ffmpeg",
+                "-y",
+                "-v",
+                "error",
+                "-i",
+                str(video_path),
+                "-vn",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-movflags",
+                "+faststart",
+                "-progress",
+                "pipe:1",
+                "-nostats",
+                str(output_path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise TranscriptionError("ffmpeg is not installed or not available on PATH.") from exc
+
+    last_processed_seconds = 0.0
+    pending_processed_seconds: Optional[float] = None
+
+    try:
+        assert process.stdout is not None
+        while True:
+            if cancel_event.is_set():
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                return
+
+            line = process.stdout.readline()
+            if line == "":
+                if process.poll() is not None:
+                    break
+                continue
+
+            normalized = line.strip()
+            if not normalized or "=" not in normalized:
+                continue
+
+            key, value = normalized.split("=", 1)
+            if key in {"out_time", "out_time_us", "out_time_ms"}:
+                parsed_seconds = parse_ffmpeg_out_time(value)
+                if parsed_seconds is not None:
+                    pending_processed_seconds = max(0.0, parsed_seconds)
+                continue
+
+            if key != "progress":
+                continue
+
+            if pending_processed_seconds is not None:
+                last_processed_seconds = pending_processed_seconds
+
+            percent: Optional[float]
+            if total_duration and total_duration > 0:
+                percent = max(0.0, min(100.0, (last_processed_seconds / total_duration) * 100.0))
+            else:
+                percent = None
+
+            yield VideoConversionProgress(
+                processed_seconds=last_processed_seconds,
+                total_estimated_seconds=total_duration,
+                percent=percent,
+            )
+
+            if value == "end":
+                break
+
+        stderr_output = ""
+        if process.stderr is not None:
+            stderr_output = process.stderr.read().strip()
+
+        return_code = process.wait()
+        if cancel_event.is_set():
+            return
+        if return_code != 0:
+            raise TranscriptionError(stderr_output or "ffmpeg exited with a non-zero status.")
+
+        if output_path.exists():
+            final_duration = total_duration if total_duration and total_duration > 0 else last_processed_seconds or None
+            yield VideoConversionProgress(
+                processed_seconds=final_duration or last_processed_seconds,
+                total_estimated_seconds=total_duration,
+                percent=100.0 if final_duration else None,
+            )
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
 
 
 def resolve_output_transcription_file_path(transcription_filename: str) -> Path:
@@ -292,6 +485,25 @@ async def health() -> dict:
 @app.get("/api/audios")
 async def list_audios(request: Request) -> dict:
     files = list_audio_library_files(audio_library_dir)
+    base_url = str(request.base_url).rstrip("/")
+
+    return {
+        "directory": str(audio_library_dir),
+        "files": [
+            {
+                "filename": item.filename,
+                "path": item.path,
+                "size_bytes": item.size_bytes,
+                "url": f"{base_url}/audios/{quote(item.path, safe='/')}",
+            }
+            for item in files
+        ],
+    }
+
+
+@app.get("/api/videos")
+async def list_videos(request: Request) -> dict:
+    files = list_video_library_files(audio_library_dir)
     base_url = str(request.base_url).rstrip("/")
 
     return {
@@ -534,6 +746,12 @@ async def receive_start_message(websocket: WebSocket) -> StartMessage:
     return StartMessage.model_validate(payload)
 
 
+async def receive_video_conversion_start_message(websocket: WebSocket) -> VideoConversionStartMessage:
+    raw = await websocket.receive_text()
+    payload = json.loads(raw)
+    return VideoConversionStartMessage.model_validate(payload)
+
+
 async def receive_audio_payload(websocket: WebSocket) -> bytes:
     buffer = bytearray()
 
@@ -560,6 +778,37 @@ async def receive_audio_payload(websocket: WebSocket) -> bytes:
             break
 
     return bytes(buffer)
+
+
+async def receive_binary_upload_to_path(websocket: WebSocket, destination: Path) -> int:
+    size_bytes = 0
+
+    with destination.open("wb") as output_stream:
+        while True:
+            message = await websocket.receive()
+            message_type = message.get("type")
+
+            if message_type == "websocket.disconnect":
+                raise WebSocketDisconnect(code=message.get("code", 1006))
+
+            if message.get("bytes") is not None:
+                chunk = message["bytes"]
+                next_size = size_bytes + len(chunk)
+                if next_size > MAX_UPLOAD_BYTES:
+                    raise UploadValidationError(get_upload_limit_message())
+                output_stream.write(chunk)
+                size_bytes = next_size
+                continue
+
+            text = message.get("text")
+            if text is None:
+                continue
+
+            if text == "__end__":
+                break
+
+    validate_upload_size(size_bytes)
+    return size_bytes
 
 
 async def watch_for_disconnect(websocket: WebSocket, cancel_event: threading.Event) -> None:
@@ -590,6 +839,48 @@ async def iter_transcription_events(
                 audio_source=audio_source,
                 model_name=model_name,
                 language=language,
+                cancel_event=cancel_event,
+            ):
+                if cancel_event.is_set():
+                    break
+                loop.call_soon_threadsafe(queue.put_nowait, item)
+        except Exception as exc:  # noqa: BLE001
+            loop.call_soon_threadsafe(queue.put_nowait, exc)
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, sentinel)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    while True:
+        if cancel_event.is_set() and queue.empty():
+            break
+        try:
+            item = await asyncio.wait_for(queue.get(), timeout=0.2)
+        except asyncio.TimeoutError:
+            continue
+        if item is sentinel:
+            break
+        if isinstance(item, Exception):
+            raise item
+        yield item
+
+
+async def iter_video_conversion_events(
+    video_path: Path,
+    output_path: Path,
+    total_duration: Optional[float],
+    cancel_event: threading.Event,
+):
+    queue: asyncio.Queue[object] = asyncio.Queue()
+    sentinel = object()
+    loop = asyncio.get_running_loop()
+
+    def worker() -> None:
+        try:
+            for item in convert_video_to_audio(
+                video_path=video_path,
+                output_path=output_path,
+                total_duration=total_duration,
                 cancel_event=cancel_event,
             ):
                 if cancel_event.is_set():
@@ -728,6 +1019,104 @@ async def ws_transcribe(websocket: WebSocket) -> None:
                 await disconnect_task
             except asyncio.CancelledError:
                 pass
+
+
+@app.websocket("/ws/v2a")
+async def ws_video_to_audio(websocket: WebSocket) -> None:
+    await websocket.accept()
+
+    job_id = str(uuid.uuid4())
+    cancel_event = threading.Event()
+    disconnect_task: Optional[asyncio.Task[None]] = None
+    resolved_video_path: Optional[Path] = None
+    output_path: Optional[Path] = None
+    completed = False
+
+    try:
+        try:
+            start = await receive_video_conversion_start_message(websocket)
+        except (ValidationError, json.JSONDecodeError) as exc:
+            await send_error_and_close(websocket, job_id, f"Invalid start message: {exc}", 1003)
+            return
+
+        try:
+            resolved_video_path = resolve_video_library_file(start.video_path, audio_library_dir)
+        except UploadValidationError as exc:
+            await send_error_and_close(websocket, job_id, str(exc), 1003)
+            return
+
+        await websocket.send_json(
+            AcceptedEvent(job_id=job_id, filename=resolved_video_path.name).model_dump()
+        )
+
+        audio_library_dir.mkdir(parents=True, exist_ok=True)
+        total_duration = probe_media_duration(resolved_video_path)
+        output_path = get_unique_audio_file_path(
+            audio_library_dir,
+            format_audio_output_filename(start.video_path),
+        )
+        disconnect_task = asyncio.create_task(watch_for_disconnect(websocket, cancel_event))
+        await websocket.send_json(
+            VideoConversionProgressEvent(
+                job_id=job_id,
+                percent=0.0 if total_duration else None,
+                processed_seconds=0.0,
+                total_estimated_seconds=total_duration,
+            ).model_dump()
+        )
+
+        async for item in iter_video_conversion_events(
+            video_path=resolved_video_path,
+            output_path=output_path,
+            total_duration=total_duration,
+            cancel_event=cancel_event,
+        ):
+            await websocket.send_json(
+                VideoConversionProgressEvent(
+                    job_id=job_id,
+                    percent=item.percent,
+                    processed_seconds=item.processed_seconds,
+                    total_estimated_seconds=item.total_estimated_seconds,
+                ).model_dump()
+            )
+            await asyncio.sleep(0)
+
+        if cancel_event.is_set():
+            return
+
+        base_url = str(websocket.base_url).rstrip("/")
+        relative_path = output_path.relative_to(audio_library_dir).as_posix()
+        await websocket.send_json(
+            VideoConversionCompleteEvent(
+                job_id=job_id,
+                filename=output_path.name,
+                path=relative_path,
+                url=f"{base_url}/audios/{quote(relative_path, safe='/')}",
+                duration_seconds=total_duration,
+            ).model_dump()
+        )
+        completed = True
+        await websocket.close(code=1000)
+
+    except UploadValidationError as exc:
+        await send_error_and_close(websocket, job_id, str(exc), 1009)
+    except TranscriptionError as exc:
+        await send_error_and_close(websocket, job_id, str(exc), 1011)
+    except WebSocketDisconnect:
+        cancel_event.set()
+        return
+    except Exception as exc:  # noqa: BLE001
+        await send_error_and_close(websocket, job_id, f"Unexpected server error: {exc}", 1011)
+    finally:
+        cancel_event.set()
+        if disconnect_task:
+            disconnect_task.cancel()
+            try:
+                await disconnect_task
+            except asyncio.CancelledError:
+                pass
+        if output_path and output_path.exists() and not completed:
+            output_path.unlink(missing_ok=True)
 
 
 if frontend_dist_dir.exists():

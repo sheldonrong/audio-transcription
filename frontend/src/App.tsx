@@ -2,8 +2,9 @@ import { useState } from "react";
 
 import DisplayPage from "./pages/DisplayPage";
 import TranscriptionPage from "./pages/TranscriptionPage";
+import V2APage from "./pages/V2APage";
 
-type Mode = "transcription" | "display";
+type Mode = "transcription" | "display" | "v2a";
 
 export default function App() {
   const [mode, setMode] = useState<Mode>("display");
@@ -38,6 +39,15 @@ export default function App() {
             >
               Transcription Mode
             </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mode === "v2a"}
+              className={mode === "v2a" ? "mode-btn active" : "mode-btn"}
+              onClick={() => setMode("v2a")}
+            >
+              V2A
+            </button>
           </div>
         </header>
 
@@ -49,6 +59,8 @@ export default function App() {
             onTranscriptChange={setTranscript}
             onSegmentsChange={setSegments}
           />
+        ) : mode === "v2a" ? (
+          <V2APage />
         ) : (
           <DisplayPage title={title} transcript={transcript} segments={segments} />
         )}

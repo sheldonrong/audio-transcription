@@ -72,8 +72,7 @@ docker run --rm -p 8000:8000 \
   dtd-app-rocm
 ```
 
-Use `WHISPER_HSA_OVERRIDE_GFX_VERSION=9.0.6` instead when your GPU reports `gfx906`.
-
+Use `HSA_OVERRIDE_GFX_VERSION=9.0.6` instead when your GPU reports `gfx906`.
 Optional overrides for legacy Vega cards:
 
 ```bash
@@ -82,8 +81,7 @@ docker run --rm -p 8000:8000 \
   --device=/dev/dri \
   --group-add video \
   -e WHISPER_DEVICE=rocm \
-  -e WHISPER_HSA_OVERRIDE_GFX_VERSION=9.0.0 \
-  -e WHISPER_ROCR_VISIBLE_DEVICES=0 \
+  -e HSA_OVERRIDE_GFX_VERSION=9.0.0 \
   -v $(pwd)/audios:/audios \
   -v $(pwd)/output:/output \
   dtd-app-rocm
@@ -134,8 +132,7 @@ Server streams events:
 - When `WHISPER_DEVICE=cpu` and `WHISPER_COMPUTE_TYPE` is not set, compute type defaults to `int8` for faster CPU transcription
 - You can override compute precision explicitly with `WHISPER_COMPUTE_TYPE` (for example `float32`, `int8`, or `int8_float16`)
 - `WHISPER_DEVICE=rocm` maps to CTranslate2 GPU runtime and requires the ROCm CTranslate2 build (see `Dockerfile.rocm`)
-- You can pass `WHISPER_HSA_OVERRIDE_GFX_VERSION` (maps to `HSA_OVERRIDE_GFX_VERSION`) as an unofficial workaround for legacy cards where ROCm detection fails
-- You can pass `WHISPER_ROCR_VISIBLE_DEVICES` (maps to `ROCR_VISIBLE_DEVICES`) to pin one AMD GPU
+- You can pass `HSA_OVERRIDE_GFX_VERSION` as an unofficial workaround for legacy cards where ROCm detection fails
 - ROCm compatibility is hardware-dependent; current ROCm docs mark `gfx900` unsupported and `gfx906` deprecated, which affects Vega-class GPUs
 - Max upload size: `1024 MB`
 - You can set `AUDIO_DIR` to override the audio library folder path

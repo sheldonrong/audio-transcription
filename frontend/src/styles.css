@@ -237,6 +237,10 @@ h1 {
   gap: 0.7rem;
 }
 
+.compact-meta {
+  margin-top: 0.8rem;
+}
+
 .metric-card {
   border: 1px solid var(--line);
   border-radius: 10px;
@@ -253,6 +257,11 @@ h1 {
 
 .metric-value {
   font-size: 1.2rem;
+}
+
+.metric-value-small {
+  font-size: 1rem;
+  overflow-wrap: anywhere;
 }
 
 .display-paper {
@@ -299,6 +308,22 @@ h1 {
 .display-transcript {
   margin: 0;
   white-space: pre-wrap;
+}
+
+.result-box p {
+  margin: 0.55rem 0 0;
+}
+
+.result-link {
+  display: inline-flex;
+  margin-top: 0.75rem;
+  color: var(--accent);
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.result-link:hover {
+  text-decoration: underline;
 }
 
 .paragraph-row {

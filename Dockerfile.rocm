@@ -11,28 +11,80 @@ RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
-FROM rocm/pytorch:latest-release AS runtime
+FROM rocm/dev-ubuntu-24.04:6.4-complete AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    OMP_NUM_THREADS=8 \
+    OMP_NUM_THREADS=6 \
     AUDIO_DIR=/audios \
     OUTPUT_DIR=/output \
     WHISPER_DEVICE=rocm \
-    WHISPER_HSA_OVERRIDE_GFX_VERSION= \
-    WHISPER_ROCR_VISIBLE_DEVICES=
+    GFX_ARCH=gfx900 \
+    HSA_OVERRIDE_GFX_VERSION=9.0.0 \
+    ROCM_VERSION=6.4 \
+    ROCM_PATH=/opt/rocm \
+    PYTHON_BIN=python3.12 \
+    LD_LIBRARY_PATH=/opt/rocm/lib/llvm/lib
 
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg libgomp1 git \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        ffmpeg \
+        git \
+        libgomp1 \
+        libjpeg-dev \
+        libomp5 \
+        pybind11-dev \
+        python3.12 \
+        python3.12-dev \
+        python3-pip \
+        python-is-python3 \
+        wget \
     && rm -rf /var/lib/apt/lists/*
 
+RUN ${PYTHON_BIN} -m pip install --break-system-packages --no-cache-dir wheel setuptools
+
+WORKDIR /opt/ctranslate2-rocm
+
+RUN git clone https://github.com/arlo-phoenix/CTranslate2-rocm.git --recurse-submodules src
+
+RUN cd /opt/ctranslate2-rocm/src \
+    && CLANG_CMAKE_CXX_COMPILER=amdclang++ \
+       CXX=amdclang++ \
+       HIPCXX="$(hipconfig -l)/clang" \
+       HIP_PATH="$(hipconfig -R)" \
+       cmake -S . -B build \
+           -DOPENMP_RUNTIME=COMP \
+           -DWITH_MKL=OFF \
+           -DWITH_HIP=ON \
+           -DCMAKE_HIP_ARCHITECTURES="${GFX_ARCH}" \
+           -DBUILD_TESTS=OFF \
+           -DWITH_CUDNN=ON
+
+RUN cd /opt/ctranslate2-rocm/src \
+    && cmake --build build -- -j"$(nproc)"
+
+RUN cd /opt/ctranslate2-rocm/src/build \
+    && cmake --install . \
+    && ldconfig
+
+RUN cd /opt/ctranslate2-rocm/src/python \
+    && ${PYTHON_BIN} -m pip install --break-system-packages --no-cache-dir -r install_requirements.txt \
+    && ${PYTHON_BIN} setup.py bdist_wheel
+
+WORKDIR /app
+
 COPY backend/requirements.txt /app/backend/requirements.txt
-RUN pip install --no-cache-dir -r /app/backend/requirements.txt \
-    && pip uninstall -y ctranslate2 \
-    && pip install --no-cache-dir --no-deps \
-      git+https://github.com/ROCm/CTranslate2.git@amd_dev#subdirectory=python
+RUN ${PYTHON_BIN} -m pip install --break-system-packages --no-cache-dir -r /app/backend/requirements.txt
+
+RUN ${PYTHON_BIN} -m pip uninstall -y ctranslate2 || true
+
+RUN test -n "$(find /opt/ctranslate2-rocm/src/python/dist -maxdepth 1 -name '*.whl' -print -quit)" \
+    && ${PYTHON_BIN} -m pip install --break-system-packages --no-cache-dir /opt/ctranslate2-rocm/src/python/dist/*.whl
 
 COPY backend /app/backend
 COPY --from=frontend-builder /app/frontend/dist /app/frontend/dist

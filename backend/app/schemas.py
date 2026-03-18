@@ -13,6 +13,12 @@ class StartMessage(BaseModel):
     model: Optional[str] = "medium"
 
 
+class VideoConversionStartMessage(BaseModel):
+    type: Literal["start"]
+    video_path: str = Field(min_length=1)
+    target_format: Literal["m4a"] = "m4a"
+
+
 class ExportSegment(BaseModel):
     start: float
     end: float
@@ -91,3 +97,20 @@ class ErrorEvent(BaseModel):
     type: Literal["error"] = "error"
     job_id: str
     message: str
+
+
+class VideoConversionProgressEvent(BaseModel):
+    type: Literal["progress"] = "progress"
+    job_id: str
+    percent: Optional[float]
+    processed_seconds: float
+    total_estimated_seconds: Optional[float]
+
+
+class VideoConversionCompleteEvent(BaseModel):
+    type: Literal["complete"] = "complete"
+    job_id: str
+    filename: str
+    path: str
+    url: str
+    duration_seconds: Optional[float]

@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import json
-import os
 import threading
 import zipfile
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from app.main import app
+from app.main import VideoConversionProgress, app
 from app.transcribe import (
     AudioLibraryFile,
     MAX_UPLOAD_MB,
@@ -16,7 +15,6 @@ from app.transcribe import (
     ModelManager,
     SegmentResult,
     TranscriptionInfo,
-    apply_rocm_env_overrides,
     get_default_compute_type,
     get_default_device,
     get_runtime_device,
@@ -24,6 +22,7 @@ from app.transcribe import (
     normalize_device,
     transcribe_audio,
     validate_upload,
+    validate_video_upload_extension,
 )
 
 
@@ -49,6 +48,17 @@ def test_validate_upload_mobile_memo_extensions() -> None:
     validate_upload("voice-note.3gp", b"abc")
     validate_upload("voice-note.amr", b"abc")
     validate_upload("voice-note.opus", b"abc")
+
+
+def test_validate_video_upload_extension() -> None:
+    validate_video_upload_extension("clip.mp4")
+    validate_video_upload_extension("clip.mkv")
+
+    try:
+        validate_video_upload_extension("clip.mov")
+        assert False, "Expected video extension validation error"
+    except Exception as exc:  # noqa: BLE001
+        assert "Unsupported video extension" in str(exc)
 
 
 def test_transcribe_audio_respects_cancel_event() -> None:
@@ -134,18 +144,6 @@ def test_device_normalization() -> None:
     assert get_runtime_device("rocm") == "cuda"
 
 
-def test_apply_rocm_env_overrides(monkeypatch) -> None:
-    monkeypatch.delenv("HSA_OVERRIDE_GFX_VERSION", raising=False)
-    monkeypatch.delenv("ROCR_VISIBLE_DEVICES", raising=False)
-    monkeypatch.setenv("WHISPER_HSA_OVERRIDE_GFX_VERSION", "9.0.0")
-    monkeypatch.setenv("WHISPER_ROCR_VISIBLE_DEVICES", "0")
-
-    apply_rocm_env_overrides()
-
-    assert os.getenv("HSA_OVERRIDE_GFX_VERSION") == "9.0.0"
-    assert os.getenv("ROCR_VISIBLE_DEVICES") == "0"
-
-
 def test_list_audios_endpoint(monkeypatch) -> None:
     monkeypatch.setattr("app.main.audio_library_dir", Path("/audios"))
     monkeypatch.setattr(
@@ -164,6 +162,26 @@ def test_list_audios_endpoint(monkeypatch) -> None:
     assert len(body["files"]) == 2
     assert body["files"][0]["url"].endswith("/audios/sample.wav")
     assert body["files"][1]["url"].endswith("/audios/set/nested.mp3")
+
+
+def test_list_videos_endpoint(monkeypatch) -> None:
+    monkeypatch.setattr("app.main.audio_library_dir", Path("/audios"))
+    monkeypatch.setattr(
+        "app.main.list_video_library_files",
+        lambda _: [
+            AudioLibraryFile(filename="sample.mp4", path="sample.mp4", size_bytes=3210),
+            AudioLibraryFile(filename="nested.mkv", path="set/nested.mkv", size_bytes=6543),
+        ],
+    )
+
+    client = TestClient(app)
+    response = client.get("/api/videos")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["directory"] == "/audios"
+    assert len(body["files"]) == 2
+    assert body["files"][0]["url"].endswith("/audios/sample.mp4")
+    assert body["files"][1]["url"].endswith("/audios/set/nested.mkv")
 
 
 def test_upload_audio_endpoint(monkeypatch, tmp_path) -> None:
@@ -293,6 +311,76 @@ def test_ws_transcribe_from_audio_library(monkeypatch) -> None:
         assert segment1["accumulated_text"] == "from library"
         assert complete["type"] == "complete"
         assert complete["segments_count"] == 1
+
+
+def test_ws_v2a_success(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("app.main.audio_library_dir", tmp_path)
+    monkeypatch.setattr("app.main.probe_media_duration", lambda _path: 4.0)
+    source_video = tmp_path / "set" / "demo.mp4"
+    source_video.parent.mkdir(parents=True, exist_ok=True)
+    source_video.write_bytes(b"fake video payload")
+
+    def fake_convert_video_to_audio(video_path, output_path, total_duration, cancel_event):
+        assert video_path == source_video
+        assert total_duration == 4.0
+        output_path.write_bytes(b"fake m4a bytes")
+        yield VideoConversionProgress(
+            processed_seconds=2.0,
+            total_estimated_seconds=4.0,
+            percent=50.0,
+        )
+        yield VideoConversionProgress(
+            processed_seconds=4.0,
+            total_estimated_seconds=4.0,
+            percent=100.0,
+        )
+
+    monkeypatch.setattr("app.main.convert_video_to_audio", fake_convert_video_to_audio)
+
+    client = TestClient(app)
+    with client.websocket_connect("/ws/v2a") as ws:
+        ws.send_json(
+            {
+                "type": "start",
+                "video_path": "set/demo.mp4",
+                "target_format": "m4a",
+            }
+        )
+
+        accepted = ws.receive_json()
+        progress0 = ws.receive_json()
+        progress1 = ws.receive_json()
+        progress2 = ws.receive_json()
+        complete = ws.receive_json()
+
+        assert accepted["type"] == "accepted"
+        assert accepted["filename"] == "demo.mp4"
+        assert progress0["type"] == "progress"
+        assert progress0["percent"] == 0.0
+        assert progress1["percent"] == 50.0
+        assert progress2["percent"] == 100.0
+        assert complete["type"] == "complete"
+        assert complete["filename"] == "demo.m4a"
+        assert complete["path"] == "set/demo.m4a"
+        assert complete["url"].endswith("/audios/set/demo.m4a")
+        assert (tmp_path / "set" / "demo.m4a").read_bytes() == b"fake m4a bytes"
+
+
+def test_ws_v2a_rejects_invalid_extension(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr("app.main.audio_library_dir", tmp_path)
+    client = TestClient(app)
+    with client.websocket_connect("/ws/v2a") as ws:
+        ws.send_json(
+            {
+                "type": "start",
+                "video_path": "demo.mov",
+                "target_format": "m4a",
+            }
+        )
+
+        error = ws.receive_json()
+        assert error["type"] == "error"
+        assert "Unsupported video extension" in error["message"]
 
 
 def test_export_transcription_file(monkeypatch, tmp_path) -> None:

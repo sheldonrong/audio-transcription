@@ -1,8 +1,13 @@
-import type { ServerEvent, StartMessage } from "../types/events";
+import type {
+  ServerEvent,
+  StartMessage,
+  VideoConversionServerEvent,
+  VideoConversionStartMessage,
+} from "../types/events";
 
-type WsCallbacks = {
+type WsCallbacks<TEvent> = {
   onOpen?: () => void;
-  onEvent?: (event: ServerEvent) => void;
+  onEvent?: (event: TEvent) => void;
   onClose?: (ev: CloseEvent) => void;
   onError?: (ev: Event) => void;
 };
@@ -10,29 +15,42 @@ type WsCallbacks = {
 const DEFAULT_CHUNK_SIZE = 256 * 1024;
 const MAX_BUFFERED_BYTES = 2 * 1024 * 1024;
 
-export class TranscriptionWsClient {
+type SendFileOptions = {
+  chunkSize?: number;
+  onProgress?: (percent: number) => void;
+};
+
+export class ChunkedUploadWsClient<TEvent, TStart extends object> {
   private socket: WebSocket;
 
-  constructor(url: string, callbacks: WsCallbacks) {
+  constructor(url: string, callbacks: WsCallbacks<TEvent>) {
     this.socket = new WebSocket(url);
     this.socket.onopen = () => callbacks.onOpen?.();
     this.socket.onmessage = (event) => {
-      const parsed = JSON.parse(event.data) as ServerEvent;
+      const parsed = JSON.parse(event.data) as TEvent;
       callbacks.onEvent?.(parsed);
     };
     this.socket.onerror = (event) => callbacks.onError?.(event);
     this.socket.onclose = (event) => callbacks.onClose?.(event);
   }
 
-  sendStart(start: StartMessage): void {
+  sendStart(start: TStart): void {
     this.socket.send(JSON.stringify(start));
   }
 
-  async sendAudio(file: Blob, chunkSize = DEFAULT_CHUNK_SIZE): Promise<void> {
+  async sendFile(file: Blob, options: SendFileOptions = {}): Promise<void> {
+    const chunkSize = options.chunkSize ?? DEFAULT_CHUNK_SIZE;
+    const totalBytes = file.size;
+
     for (let offset = 0; offset < file.size; offset += chunkSize) {
       const chunk = await file.slice(offset, offset + chunkSize).arrayBuffer();
       this.socket.send(chunk);
+      options.onProgress?.((Math.min(offset + chunk.byteLength, totalBytes) / totalBytes) * 100);
       await this.waitForDrain();
+    }
+
+    if (totalBytes === 0) {
+      options.onProgress?.(100);
     }
   }
 
@@ -54,3 +72,10 @@ export class TranscriptionWsClient {
     }
   }
 }
+
+export class TranscriptionWsClient extends ChunkedUploadWsClient<ServerEvent, StartMessage> {}
+
+export class VideoConversionWsClient extends ChunkedUploadWsClient<
+  VideoConversionServerEvent,
+  VideoConversionStartMessage
+> {}

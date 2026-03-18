@@ -50,3 +50,32 @@ export type StartMessage = {
   language: string;
   model: string;
 };
+
+export type VideoConversionProgressEvent = {
+  type: "progress";
+  job_id: string;
+  percent: number | null;
+  processed_seconds: number;
+  total_estimated_seconds: number | null;
+};
+
+export type VideoConversionCompleteEvent = {
+  type: "complete";
+  job_id: string;
+  filename: string;
+  path: string;
+  url: string;
+  duration_seconds: number | null;
+};
+
+export type VideoConversionServerEvent =
+  | AcceptedEvent
+  | VideoConversionProgressEvent
+  | VideoConversionCompleteEvent
+  | ErrorEvent;
+
+export type VideoConversionStartMessage = {
+  type: "start";
+  video_path: string;
+  target_format: "m4a";
+};

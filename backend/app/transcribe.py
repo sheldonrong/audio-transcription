@@ -26,6 +26,10 @@ ALLOWED_EXTENSIONS = {
     ".opus",
     ".caf",
 }
+VIDEO_ALLOWED_EXTENSIONS = {
+    ".mkv",
+    ".mp4",
+}
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_AUDIO_DIR = Path("/audios")
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output"
@@ -59,17 +63,6 @@ def get_runtime_device(device: str) -> str:
         # ROCm-enabled CTranslate2 builds expose the GPU backend through "cuda".
         return "cuda"
     return normalized
-
-
-def apply_rocm_env_overrides() -> None:
-    # Optional helper envs for legacy/unsupported ROCm cards (for example Vega).
-    hsa_override = _read_env_setting("WHISPER_HSA_OVERRIDE_GFX_VERSION")
-    if hsa_override and not _read_env_setting("HSA_OVERRIDE_GFX_VERSION"):
-        os.environ["HSA_OVERRIDE_GFX_VERSION"] = hsa_override
-
-    rocr_visible = _read_env_setting("WHISPER_ROCR_VISIBLE_DEVICES")
-    if rocr_visible and not _read_env_setting("ROCR_VISIBLE_DEVICES"):
-        os.environ["ROCR_VISIBLE_DEVICES"] = rocr_visible
 
 
 def is_cpu_device(device: str) -> bool:
@@ -124,8 +117,6 @@ class AudioLibraryFile:
 class ModelManager:
     def __init__(self, device: Optional[str] = None, compute_type: Optional[str] = None) -> None:
         resolved_device = normalize_device(device or DEFAULT_DEVICE)
-        if resolved_device == "rocm":
-            apply_rocm_env_overrides()
         resolved_compute_type = (
             compute_type.strip().lower() if compute_type and compute_type.strip() else get_default_compute_type(resolved_device)
         )
@@ -179,10 +170,26 @@ def validate_upload_extension(filename: str) -> None:
         )
 
 
-def resolve_audio_library_file(audio_path: str, audio_dir: Optional[Path] = None) -> Path:
-    normalized_path = (audio_path or "").strip()
+def validate_video_upload_extension(filename: str) -> None:
+    lowered = filename.lower()
+    if not any(lowered.endswith(ext) for ext in VIDEO_ALLOWED_EXTENSIONS):
+        raise UploadValidationError(
+            "Unsupported video extension. Allowed: " + ", ".join(sorted(VIDEO_ALLOWED_EXTENSIONS))
+        )
+
+
+def _resolve_library_file(
+    relative_path: str,
+    *,
+    audio_dir: Optional[Path],
+    extension_validator,
+    missing_path_message: str,
+    missing_file_message: str,
+    outside_path_message: str,
+) -> Path:
+    normalized_path = (relative_path or "").strip()
     if not normalized_path:
-        raise UploadValidationError("Missing audio path.")
+        raise UploadValidationError(missing_path_message)
 
     directory = (audio_dir or get_audio_library_dir()).resolve()
     if not directory.exists() or not directory.is_dir():
@@ -192,14 +199,37 @@ def resolve_audio_library_file(audio_path: str, audio_dir: Optional[Path] = None
     try:
         candidate.relative_to(directory)
     except ValueError as exc:
-        raise UploadValidationError("Invalid audio path outside /audios directory.") from exc
+        raise UploadValidationError(outside_path_message) from exc
+
+    extension_validator(candidate.name)
 
     if not candidate.is_file():
-        raise UploadValidationError(f"Audio file not found in /audios: {normalized_path}")
+        raise UploadValidationError(f"{missing_file_message}: {normalized_path}")
 
-    validate_upload_extension(candidate.name)
     validate_upload_size(candidate.stat().st_size)
     return candidate
+
+
+def resolve_audio_library_file(audio_path: str, audio_dir: Optional[Path] = None) -> Path:
+    return _resolve_library_file(
+        audio_path,
+        audio_dir=audio_dir,
+        extension_validator=validate_upload_extension,
+        missing_path_message="Missing audio path.",
+        missing_file_message="Audio file not found in /audios",
+        outside_path_message="Invalid audio path outside /audios directory.",
+    )
+
+
+def resolve_video_library_file(video_path: str, audio_dir: Optional[Path] = None) -> Path:
+    return _resolve_library_file(
+        video_path,
+        audio_dir=audio_dir,
+        extension_validator=validate_video_upload_extension,
+        missing_path_message="Missing video path.",
+        missing_file_message="Video file not found in /audios",
+        outside_path_message="Invalid video path outside /audios directory.",
+    )
 
 
 def get_audio_library_dir() -> Path:
@@ -226,7 +256,7 @@ def get_output_dir() -> Path:
     return DEFAULT_OUTPUT_DIR
 
 
-def list_audio_library_files(audio_dir: Optional[Path] = None) -> list[AudioLibraryFile]:
+def _list_library_files(audio_dir: Optional[Path], allowed_extensions: set[str]) -> list[AudioLibraryFile]:
     directory = audio_dir or get_audio_library_dir()
     if not directory.exists() or not directory.is_dir():
         return []
@@ -237,7 +267,7 @@ def list_audio_library_files(audio_dir: Optional[Path] = None) -> list[AudioLibr
             continue
 
         lowered = candidate.name.lower()
-        if not any(lowered.endswith(ext) for ext in ALLOWED_EXTENSIONS):
+        if not any(lowered.endswith(ext) for ext in allowed_extensions):
             continue
 
         relative = candidate.relative_to(directory).as_posix()
@@ -251,6 +281,14 @@ def list_audio_library_files(audio_dir: Optional[Path] = None) -> list[AudioLibr
 
     files.sort(key=lambda item: item.path.lower())
     return files
+
+
+def list_audio_library_files(audio_dir: Optional[Path] = None) -> list[AudioLibraryFile]:
+    return _list_library_files(audio_dir, ALLOWED_EXTENSIONS)
+
+
+def list_video_library_files(audio_dir: Optional[Path] = None) -> list[AudioLibraryFile]:
+    return _list_library_files(audio_dir, VIDEO_ALLOWED_EXTENSIONS)
 
 
 def load_audio_from_library(audio_path: str, audio_dir: Optional[Path] = None) -> tuple[str, bytes]:
