@@ -93,6 +93,9 @@ COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 RUN mkdir -p /audios /output
 RUN chmod +x /app/docker-entrypoint.sh
 
+RUN cd /tmp && curl -L https://raw.githubusercontent.com/sheldonrong/rocblas-gfx900/refs/heads/main/rocblas_64.tar.gz --output rocblas.tar.gz \
+    && tar -xvf rocblas.tar.gz && cp /tmp/rocblas/lib/rocblas/library/TensileLibrary_*_gfx900.* /opt/rocm-6.4.0/lib/rocblas/library/
+
 WORKDIR /app/backend
 
 EXPOSE 8000
