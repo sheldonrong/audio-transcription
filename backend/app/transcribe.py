@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import io
+import json
 import os
+import re
+import subprocess
 import threading
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 from faster_whisper import WhisperModel
 
@@ -114,6 +118,202 @@ class AudioLibraryFile:
     size_bytes: int
 
 
+@dataclass(frozen=True)
+class AmdGpuInfo:
+    device_id: int
+    name: str
+    bus_id: Optional[str] = None
+    uuid: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class AmdGpuInventory:
+    gpus: list[AmdGpuInfo]
+    detected_at: str
+    detection_method: Optional[str] = None
+    detection_error: Optional[str] = None
+
+
+def _clean_optional_text(value: object) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _extract_card_index(value: object) -> Optional[int]:
+    if not isinstance(value, str):
+        return None
+    match = re.search(r"(\d+)", value)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def _parse_rocm_smi_gpus(payload: str) -> list[AmdGpuInfo]:
+    try:
+        raw = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid rocm-smi JSON output: {exc}") from exc
+
+    if not isinstance(raw, dict):
+        raise ValueError("Unexpected rocm-smi output shape.")
+
+    gpus: list[AmdGpuInfo] = []
+    for card_name, details in raw.items():
+        if not isinstance(details, dict):
+            continue
+
+        device_id = _extract_card_index(card_name)
+        if device_id is None:
+            continue
+
+        name = (
+            _clean_optional_text(details.get("Device Name"))
+            or _clean_optional_text(details.get("Card series"))
+            or _clean_optional_text(details.get("Product Name"))
+            or _clean_optional_text(details.get("Marketing Name"))
+            or f"AMD GPU {device_id}"
+        )
+        bus_id = (
+            _clean_optional_text(details.get("PCI Bus"))
+            or _clean_optional_text(details.get("PCI Bus ID"))
+            or _clean_optional_text(details.get("PCIe Bus"))
+        )
+        uuid = _clean_optional_text(details.get("Unique ID")) or _clean_optional_text(details.get("UUID"))
+        gpus.append(AmdGpuInfo(device_id=device_id, name=name, bus_id=bus_id, uuid=uuid))
+
+    if not gpus:
+        raise ValueError("No GPU entries found in rocm-smi output.")
+
+    return sorted(gpus, key=lambda gpu: gpu.device_id)
+
+
+def _parse_rocminfo_gpus(payload: str) -> list[AmdGpuInfo]:
+    blocks = re.split(r"(?m)^Agent\s+\d+\s*$", payload)
+    gpus: list[AmdGpuInfo] = []
+
+    for block in blocks:
+        lines = [line.rstrip() for line in block.splitlines() if line.strip()]
+        if not lines:
+            continue
+
+        parsed: dict[str, str] = {}
+        for line in lines:
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            parsed[key.strip()] = value.strip()
+
+        device_type = parsed.get("Type", "").strip().upper()
+        if device_type != "GPU":
+            continue
+
+        name = parsed.get("Marketing Name") or parsed.get("Name") or f"AMD GPU {len(gpus)}"
+        bus_id = parsed.get("BDFID") or parsed.get("PCI Bus")
+        uuid = parsed.get("Uuid") or parsed.get("UUID")
+        gpus.append(
+            AmdGpuInfo(
+                device_id=len(gpus),
+                name=name.strip(),
+                bus_id=bus_id.strip() if isinstance(bus_id, str) and bus_id.strip() else None,
+                uuid=uuid.strip() if isinstance(uuid, str) and uuid.strip() else None,
+            )
+        )
+
+    if not gpus:
+        raise ValueError("No GPU agents found in rocminfo output.")
+
+    return gpus
+
+
+def detect_amd_gpus() -> AmdGpuInventory:
+    detected_at = datetime.now(timezone.utc).isoformat()
+    detection_attempts = (
+        (
+            "rocm-smi",
+            ["rocm-smi", "--showproductname", "--showbus", "--showuniqueid", "--json"],
+            _parse_rocm_smi_gpus,
+        ),
+        ("rocminfo", ["rocminfo"], _parse_rocminfo_gpus),
+    )
+    errors: list[str] = []
+
+    for method_name, command, parser in detection_attempts:
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, check=True)
+        except FileNotFoundError:
+            errors.append(f"{method_name} not found")
+            continue
+        except subprocess.CalledProcessError as exc:
+            detail = exc.stderr.strip() or exc.stdout.strip() or str(exc)
+            errors.append(f"{method_name} failed: {detail}")
+            continue
+
+        try:
+            gpus = parser(result.stdout)
+        except ValueError as exc:
+            errors.append(f"{method_name} parse error: {exc}")
+            continue
+
+        return AmdGpuInventory(
+            gpus=gpus,
+            detected_at=detected_at,
+            detection_method=method_name,
+        )
+
+    detection_error = "; ".join(errors) if errors else "No AMD GPU detection method succeeded."
+    return AmdGpuInventory(gpus=[], detected_at=detected_at, detection_error=detection_error)
+
+
+def get_detected_amd_gpu_inventory() -> AmdGpuInventory:
+    return DETECTED_AMD_GPU_INVENTORY
+
+
+def normalize_device_ids(device_ids: Optional[Sequence[int]]) -> tuple[int, ...]:
+    if not device_ids:
+        return ()
+
+    normalized: list[int] = []
+    seen: set[int] = set()
+    for raw_value in device_ids:
+        value = int(raw_value)
+        if value < 0:
+            raise ValueError("GPU device IDs must be zero or greater.")
+        if value in seen:
+            continue
+        seen.add(value)
+        normalized.append(value)
+
+    return tuple(normalized)
+
+
+def validate_device_ids(device: str, device_ids: Optional[Sequence[int]]) -> tuple[int, ...]:
+    normalized = normalize_device_ids(device_ids)
+    if not normalized:
+        return normalized
+
+    if is_cpu_device(device):
+        raise TranscriptionError("GPU device IDs are not supported when WHISPER_DEVICE=cpu.")
+
+    detected = get_detected_amd_gpu_inventory()
+    if detected.gpus:
+        available_ids = {gpu.device_id for gpu in detected.gpus}
+        invalid_ids = [device_id for device_id in normalized if device_id not in available_ids]
+        if invalid_ids:
+            raise TranscriptionError(
+                "Unknown AMD GPU device ID(s): "
+                + ", ".join(str(device_id) for device_id in invalid_ids)
+                + ". Available IDs: "
+                + ", ".join(str(device_id) for device_id in sorted(available_ids))
+            )
+
+    return normalized
+
+
+DETECTED_AMD_GPU_INVENTORY = detect_amd_gpus()
+
+
 class ModelManager:
     def __init__(self, device: Optional[str] = None, compute_type: Optional[str] = None) -> None:
         resolved_device = normalize_device(device or DEFAULT_DEVICE)
@@ -123,30 +323,51 @@ class ModelManager:
         self.device = resolved_device
         self.runtime_device = get_runtime_device(resolved_device)
         self.compute_type = resolved_compute_type
-        self._models: dict[str, WhisperModel] = {}
+        self._models: dict[tuple[str, tuple[int, ...]], WhisperModel] = {}
         self._lock = threading.Lock()
 
-    def get(self, model_name: str) -> WhisperModel:
+    def get(self, model_name: str, device_ids: Optional[Sequence[int]] = None) -> WhisperModel:
+        normalized_device_ids = validate_device_ids(self.device, device_ids)
+        cache_key = (model_name, normalized_device_ids)
+
         with self._lock:
-            if model_name in self._models:
-                return self._models[model_name]
+            if cache_key in self._models:
+                return self._models[cache_key]
 
             try:
-                model = WhisperModel(model_name, device=self.runtime_device, compute_type=self.compute_type)
+                model_kwargs: dict[str, object] = {
+                    "device": self.runtime_device,
+                    "compute_type": self.compute_type,
+                }
+                if normalized_device_ids:
+                    model_kwargs["device_index"] = (
+                        list(normalized_device_ids)
+                        if len(normalized_device_ids) > 1
+                        else normalized_device_ids[0]
+                    )
+                    if len(normalized_device_ids) > 1:
+                        model_kwargs["num_workers"] = len(normalized_device_ids)
+
+                model = WhisperModel(model_name, **model_kwargs)
             except Exception as exc:  # noqa: BLE001
                 runtime_hint = (
                     f"{self.device} (mapped runtime backend: {self.runtime_device})"
                     if self.device != self.runtime_device
                     else self.device
                 )
+                device_ids_hint = (
+                    f", device_ids={list(normalized_device_ids)}"
+                    if normalized_device_ids
+                    else ""
+                )
                 raise TranscriptionError(
                     f"Failed to initialize model '{model_name}' with device={runtime_hint}, "
-                    f"compute_type={self.compute_type}. For WHISPER_DEVICE=rocm, install a ROCm-enabled "
+                    f"compute_type={self.compute_type}{device_ids_hint}. For WHISPER_DEVICE=rocm, install a ROCm-enabled "
                     "CTranslate2 build and pass ROCm devices into the container/host runtime. "
                     f"Original error: {exc}"
                 ) from exc
 
-            self._models[model_name] = model
+            self._models[cache_key] = model
             return model
 
 
@@ -303,9 +524,10 @@ def transcribe_audio(
     audio_source: bytes | str | Path,
     model_name: str,
     language: Optional[str],
+    device_ids: Optional[Sequence[int]] = None,
     cancel_event: Optional[threading.Event] = None,
 ):
-    model = model_manager.get(model_name)
+    model = model_manager.get(model_name, device_ids=device_ids)
     audio_input = io.BytesIO(audio_source) if isinstance(audio_source, bytes) else str(audio_source)
 
     whisper_language = None if language in (None, "", "auto") else language

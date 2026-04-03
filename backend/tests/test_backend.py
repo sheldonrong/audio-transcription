@@ -9,6 +9,8 @@ from fastapi.testclient import TestClient
 
 from app.main import VideoConversionProgress, app
 from app.transcribe import (
+    AmdGpuInfo,
+    AmdGpuInventory,
     AudioLibraryFile,
     MAX_UPLOAD_MB,
     MAX_UPLOAD_BYTES,
@@ -20,7 +22,10 @@ from app.transcribe import (
     get_runtime_device,
     is_cpu_device,
     normalize_device,
+    normalize_device_ids,
+    validate_device_ids,
     transcribe_audio,
+    _parse_rocm_smi_gpus,
     validate_upload,
     validate_video_upload_extension,
 )
@@ -75,7 +80,7 @@ def test_transcribe_audio_respects_cancel_event() -> None:
             return [FakeSegment()], FakeInfo()
 
     class FakeManager:
-        def get(self, _model_name: str):
+        def get(self, _model_name: str, **_kwargs):
             return FakeModel()
 
     cancel_event = threading.Event()
@@ -144,6 +149,42 @@ def test_device_normalization() -> None:
     assert get_runtime_device("rocm") == "cuda"
 
 
+def test_normalize_device_ids_deduplicates_and_preserves_order() -> None:
+    assert normalize_device_ids([2, 0, 2, 1]) == (2, 0, 1)
+
+
+def test_validate_device_ids_rejects_cpu_runtime() -> None:
+    try:
+        validate_device_ids("cpu", [0])
+        assert False, "Expected device ID validation failure"
+    except Exception as exc:  # noqa: BLE001
+        assert "WHISPER_DEVICE=cpu" in str(exc)
+
+
+def test_parse_rocm_smi_output() -> None:
+    parsed = _parse_rocm_smi_gpus(
+        json.dumps(
+            {
+                "card0": {
+                    "Device Name": "AMD Radeon Pro W6800",
+                    "PCI Bus": "0000:03:00.0",
+                    "Unique ID": "GPU-0",
+                },
+                "card1": {
+                    "Card series": "AMD Instinct MI210",
+                    "PCI Bus ID": "0000:04:00.0",
+                    "UUID": "GPU-1",
+                },
+            }
+        )
+    )
+
+    assert [gpu.device_id for gpu in parsed] == [0, 1]
+    assert parsed[0].name == "AMD Radeon Pro W6800"
+    assert parsed[1].bus_id == "0000:04:00.0"
+    assert parsed[1].uuid == "GPU-1"
+
+
 def test_list_audios_endpoint(monkeypatch) -> None:
     monkeypatch.setattr("app.main.audio_library_dir", Path("/audios"))
     monkeypatch.setattr(
@@ -182,6 +223,39 @@ def test_list_videos_endpoint(monkeypatch) -> None:
     assert len(body["files"]) == 2
     assert body["files"][0]["url"].endswith("/audios/sample.mp4")
     assert body["files"][1]["url"].endswith("/audios/set/nested.mkv")
+
+
+def test_list_amd_gpus_endpoint(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.main.detected_amd_gpu_inventory",
+        AmdGpuInventory(
+            gpus=[
+                AmdGpuInfo(
+                    device_id=0,
+                    name="AMD Instinct MI210",
+                    bus_id="0000:03:00.0",
+                    uuid="GPU-0",
+                )
+            ],
+            detected_at="2026-04-03T00:00:00+00:00",
+            detection_method="rocm-smi",
+        ),
+    )
+
+    client = TestClient(app)
+    response = client.get("/api/hardware/amd-gpus")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["detection_method"] == "rocm-smi"
+    assert body["gpus"] == [
+        {
+            "device_id": 0,
+            "name": "AMD Instinct MI210",
+            "bus_id": "0000:03:00.0",
+            "uuid": "GPU-0",
+        }
+    ]
 
 
 def test_upload_audio_endpoint(monkeypatch, tmp_path) -> None:
@@ -236,7 +310,10 @@ def test_upload_audio_endpoint_rejects_non_audio(monkeypatch, tmp_path) -> None:
 
 
 def test_ws_transcribe_success(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
     def fake_transcribe_audio(*args, **kwargs):
+        captured["device_ids"] = kwargs.get("device_ids")
         yield TranscriptionInfo(duration=10.0)
         yield SegmentResult(index=0, start=0.0, end=3.0, text="hello")
         yield SegmentResult(index=1, start=3.0, end=10.0, text="world")
@@ -251,6 +328,7 @@ def test_ws_transcribe_success(monkeypatch) -> None:
                 "filename": "sample.wav",
                 "language": "en",
                 "model": "medium",
+                "device_ids": [0, 1],
             }
         )
         ws.send_bytes(b"fake audio")
@@ -270,20 +348,21 @@ def test_ws_transcribe_success(monkeypatch) -> None:
         assert segment2["accumulated_text"] == "hello world"
         assert complete["type"] == "complete"
         assert complete["segments_count"] == 2
+        assert captured["device_ids"] == [0, 1]
 
 
 def test_ws_transcribe_from_audio_library(monkeypatch) -> None:
     called: dict[str, str | None] = {"path": None}
 
-    def fake_load_audio_from_library(path: str, *_args):
+    def fake_resolve_audio_library_file(path: str, *_args):
         called["path"] = path
-        return "sample.wav", b"fake audio"
+        return Path("/audios/sample.wav")
 
     def fake_transcribe_audio(*args, **kwargs):
         yield TranscriptionInfo(duration=5.0)
         yield SegmentResult(index=0, start=0.0, end=5.0, text="from library")
 
-    monkeypatch.setattr("app.main.load_audio_from_library", fake_load_audio_from_library)
+    monkeypatch.setattr("app.main.resolve_audio_library_file", fake_resolve_audio_library_file)
     monkeypatch.setattr("app.main.transcribe_audio", fake_transcribe_audio)
 
     client = TestClient(app)

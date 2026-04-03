@@ -31,6 +31,8 @@ from starlette.websockets import WebSocketState
 
 from app.schemas import (
     AcceptedEvent,
+    AmdGpuInfoResponse,
+    AmdGpuListResponse,
     CompleteEvent,
     ErrorEvent,
     ExportTranscriptionFileListResponse,
@@ -57,6 +59,7 @@ from app.transcribe import (
     TranscriptionError,
     TranscriptionInfo,
     UploadValidationError,
+    get_detected_amd_gpu_inventory,
     get_upload_limit_message,
     get_audio_library_dir,
     get_output_dir,
@@ -82,6 +85,7 @@ app.add_middleware(
 )
 
 model_manager = ModelManager(device=DEFAULT_DEVICE, compute_type=DEFAULT_COMPUTE_TYPE)
+detected_amd_gpu_inventory = get_detected_amd_gpu_inventory()
 audio_library_dir = get_audio_library_dir()
 app.mount("/audios", StaticFiles(directory=str(audio_library_dir), check_dir=False), name="audios")
 output_dir = get_output_dir()
@@ -482,6 +486,24 @@ async def health() -> dict:
     }
 
 
+@app.get("/api/hardware/amd-gpus", response_model=AmdGpuListResponse)
+async def list_amd_gpus() -> AmdGpuListResponse:
+    return AmdGpuListResponse(
+        gpus=[
+            AmdGpuInfoResponse(
+                device_id=gpu.device_id,
+                name=gpu.name,
+                bus_id=gpu.bus_id,
+                uuid=gpu.uuid,
+            )
+            for gpu in detected_amd_gpu_inventory.gpus
+        ],
+        detected_at=detected_amd_gpu_inventory.detected_at,
+        detection_method=detected_amd_gpu_inventory.detection_method,
+        detection_error=detected_amd_gpu_inventory.detection_error,
+    )
+
+
 @app.get("/api/audios")
 async def list_audios(request: Request) -> dict:
     files = list_audio_library_files(audio_library_dir)
@@ -826,6 +848,7 @@ async def iter_transcription_events(
     audio_source: bytes | str,
     model_name: str,
     language: Optional[str],
+    device_ids: list[int],
     cancel_event: threading.Event,
 ):
     queue: asyncio.Queue[object] = asyncio.Queue()
@@ -839,6 +862,7 @@ async def iter_transcription_events(
                 audio_source=audio_source,
                 model_name=model_name,
                 language=language,
+                device_ids=device_ids,
                 cancel_event=cancel_event,
             ):
                 if cancel_event.is_set():
@@ -944,6 +968,7 @@ async def ws_transcribe(websocket: WebSocket) -> None:
             audio_source=audio_source,
             model_name=start.model or DEFAULT_MODEL,
             language=start.language,
+            device_ids=start.device_ids,
             cancel_event=cancel_event,
         ):
             if isinstance(item, TranscriptionInfo):

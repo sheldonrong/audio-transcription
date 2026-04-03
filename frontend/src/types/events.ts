@@ -49,6 +49,7 @@ export type StartMessage = {
   audio_path?: string;
   language: string;
   model: string;
+  device_ids: number[];
 };
 
 export type VideoConversionProgressEvent = {

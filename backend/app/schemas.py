@@ -11,6 +11,21 @@ class StartMessage(BaseModel):
     audio_path: Optional[str] = None
     language: Optional[str] = "auto"
     model: Optional[str] = "medium"
+    device_ids: list[int] = Field(default_factory=list)
+
+
+class AmdGpuInfoResponse(BaseModel):
+    device_id: int = Field(ge=0)
+    name: str = Field(min_length=1)
+    bus_id: Optional[str] = None
+    uuid: Optional[str] = None
+
+
+class AmdGpuListResponse(BaseModel):
+    gpus: list[AmdGpuInfoResponse]
+    detected_at: str
+    detection_method: Optional[str] = None
+    detection_error: Optional[str] = None
 
 
 class VideoConversionStartMessage(BaseModel):

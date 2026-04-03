@@ -25,6 +25,7 @@ type Props = {
   onTitleChange: (value: string) => void;
   onTranscriptChange: (value: string) => void;
   onSegmentsChange: (segments: TranscribedSegment[]) => void;
+  selectedDeviceIds: number[];
 };
 
 type UploadAudioResponse = {
@@ -102,6 +103,7 @@ export default function TranscriptionPage({
   onTitleChange,
   onTranscriptChange,
   onSegmentsChange,
+  selectedDeviceIds,
 }: Props) {
   const [status, setStatus] = useState<UiStatus>("idle");
   const [audioFiles, setAudioFiles] = useState<
@@ -333,6 +335,7 @@ export default function TranscriptionPage({
             audio_path: selectedAudio.path,
             language: DEFAULT_LANGUAGE,
             model: DEFAULT_MODEL,
+            device_ids: selectedDeviceIds,
           });
         } catch (e) {
           setStatus("error");
@@ -533,6 +536,9 @@ export default function TranscriptionPage({
       <div className="status-row">
         <strong>Status:</strong> {status}
         <span className="meta">Processed: {processedSeconds.toFixed(1)}s</span>
+        <span className="meta">
+          Inference GPUs: {selectedDeviceIds.length > 0 ? selectedDeviceIds.join(", ") : "backend default"}
+        </span>
       </div>
 
       <div className="progress-wrap">

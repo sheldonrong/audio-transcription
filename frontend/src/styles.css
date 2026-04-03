@@ -49,6 +49,25 @@ h1 {
   gap: 0.55rem;
 }
 
+.mode-header-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.mode-title-wrap {
+  display: grid;
+  gap: 0.3rem;
+}
+
+.header-meta {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+
 .mode-switch {
   display: inline-flex;
   width: fit-content;
@@ -77,6 +96,77 @@ h1 {
 
 .subtitle {
   margin-top: 0.3rem;
+  color: var(--muted);
+}
+
+.settings-wrap {
+  position: relative;
+}
+
+.settings-cog {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: white;
+  color: var(--text);
+  padding: 0.55rem 0.85rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.settings-cog.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(8, 105, 114, 0.12);
+}
+
+.settings-dropdown {
+  position: absolute;
+  top: calc(100% + 0.55rem);
+  right: 0;
+  z-index: 5;
+  width: min(360px, calc(100vw - 2rem));
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 0.85rem;
+  background: var(--panel);
+  box-shadow: 0 18px 42px rgba(8, 105, 114, 0.18);
+  display: grid;
+  gap: 0.7rem;
+}
+
+.settings-copy {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.settings-copy p {
+  margin: 0;
+}
+
+.settings-list {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.settings-option {
+  display: flex;
+  gap: 0.65rem;
+  align-items: flex-start;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0.65rem 0.75rem;
+  background: #fbfffd;
+}
+
+.settings-option input {
+  margin-top: 0.15rem;
+}
+
+.settings-option span {
+  display: grid;
+  gap: 0.15rem;
+}
+
+.settings-option small {
   color: var(--muted);
 }
 
@@ -403,6 +493,24 @@ h1 {
 }
 
 @media (max-width: 720px) {
+  .mode-header-top {
+    align-items: stretch;
+  }
+
+  .settings-wrap {
+    width: 100%;
+  }
+
+  .settings-cog {
+    width: 100%;
+  }
+
+  .settings-dropdown {
+    position: static;
+    width: 100%;
+    margin-top: 0.55rem;
+  }
+
   .controls-grid {
     grid-template-columns: 1fr;
   }
