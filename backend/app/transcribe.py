@@ -167,7 +167,12 @@ def _parse_rocm_smi_gpus(payload: str) -> list[AmdGpuInfo]:
         if device_id is None:
             continue
 
-        name = _clean_optional_text(details.get("Card Series"))
+        name = (
+            _clean_optional_text(details.get("Card Series"))
+            or _clean_optional_text(details.get("Device Name"))
+            or _clean_optional_text(details.get("Marketing Name"))
+            or f"AMD GPU {device_id}"
+        )
         gfx_version = _clean_optional_text(details.get("GFX Version"))
         gpus.append(AmdGpuInfo(device_id=device_id, name=name, gfx_version=gfx_version))
 
@@ -217,8 +222,13 @@ def detect_amd_gpus() -> AmdGpuInventory:
     detected_at = datetime.now(timezone.utc).isoformat()
     detection_attempts = (
         (
+            "rocm-smi --showhw",
+            ["rocm-smi", "--showproductname", "--showhw", "--json"],
+            _parse_rocm_smi_gpus,
+        ),
+        (
             "rocm-smi",
-            ["rocm-smi", "--showproductname", "--showgfxversion", "--json"],
+            ["rocm-smi", "--showproductname", "--json"],
             _parse_rocm_smi_gpus,
         ),
         ("rocminfo", ["rocminfo"], _parse_rocminfo_gpus),

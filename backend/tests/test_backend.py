@@ -182,6 +182,22 @@ def test_parse_rocm_smi_output() -> None:
     assert parsed[1].gfx_version == "90a"
 
 
+def test_parse_rocm_smi_output_without_gfx_version() -> None:
+    parsed = _parse_rocm_smi_gpus(
+        json.dumps(
+            {
+                "card0": {
+                    "Card Series": "AMD Radeon Pro W6800",
+                }
+            }
+        )
+    )
+
+    assert len(parsed) == 1
+    assert parsed[0].name == "AMD Radeon Pro W6800"
+    assert parsed[0].gfx_version is None
+
+
 def test_list_audios_endpoint(monkeypatch) -> None:
     monkeypatch.setattr("app.main.audio_library_dir", Path("/audios"))
     monkeypatch.setattr(
