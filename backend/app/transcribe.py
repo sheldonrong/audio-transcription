@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import io
 import json
 import os
@@ -322,6 +323,26 @@ class ModelManager:
         self._models: dict[tuple[str, tuple[int, ...]], WhisperModel] = {}
         self._lock = threading.Lock()
 
+    def _evict_conflicting_models(
+        self,
+        model_name: str,
+        normalized_device_ids: tuple[int, ...],
+    ) -> None:
+        stale_keys = [
+            key
+            for key in self._models
+            if key[0] == model_name and key[1] != normalized_device_ids
+        ]
+        if not stale_keys:
+            return
+
+        for key in stale_keys:
+            del self._models[key]
+
+        # Drop Python references promptly so the underlying CTranslate2 runtime
+        # can release device allocations when the selected GPU set changes.
+        gc.collect()
+
     def get(self, model_name: str, device_ids: Optional[Sequence[int]] = None) -> WhisperModel:
         normalized_device_ids = validate_device_ids(self.device, device_ids)
         cache_key = (model_name, normalized_device_ids)
@@ -329,6 +350,8 @@ class ModelManager:
         with self._lock:
             if cache_key in self._models:
                 return self._models[cache_key]
+
+            self._evict_conflicting_models(model_name, normalized_device_ids)
 
             try:
                 model_kwargs: dict[str, object] = {

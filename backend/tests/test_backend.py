@@ -5,6 +5,7 @@ import threading
 import zipfile
 from pathlib import Path
 
+import app.transcribe as transcribe_module
 from fastapi.testclient import TestClient
 
 from app.main import VideoConversionProgress, app
@@ -144,6 +145,36 @@ def test_rocm_device_maps_to_cuda_runtime() -> None:
     assert manager.compute_type == "float16"
 
 
+def test_model_manager_evicts_stale_device_specific_models(monkeypatch) -> None:
+    created: list[dict[str, object]] = []
+
+    class FakeWhisperModel:
+        def __init__(self, _model_name: str, **kwargs):
+            created.append(kwargs)
+
+    monkeypatch.setattr(transcribe_module, "WhisperModel", FakeWhisperModel)
+    monkeypatch.setattr(
+        transcribe_module,
+        "get_detected_amd_gpu_inventory",
+        lambda: AmdGpuInventory(
+            gpus=[
+                AmdGpuInfo(device_id=0, name="GPU 0"),
+                AmdGpuInfo(device_id=1, name="GPU 1"),
+            ],
+            detected_at="2026-04-03T00:00:00+00:00",
+        ),
+    )
+
+    manager = ModelManager(device="rocm")
+    manager.get("medium", device_ids=[0, 1])
+    manager.get("medium", device_ids=[0])
+
+    assert len(manager._models) == 1
+    assert ("medium", (0,)) in manager._models
+    assert created[0]["device_index"] == [0, 1]
+    assert created[1]["device_index"] == 0
+
+
 def test_device_normalization() -> None:
     assert normalize_device(" CPU ") == "cpu"
     assert get_runtime_device("rocm") == "cuda"
@@ -159,7 +190,6 @@ def test_validate_device_ids_rejects_cpu_runtime() -> None:
         assert False, "Expected device ID validation failure"
     except Exception as exc:  # noqa: BLE001
         assert "WHISPER_DEVICE=cpu" in str(exc)
-
 
 def test_parse_rocm_smi_output() -> None:
     parsed = _parse_rocm_smi_gpus(
