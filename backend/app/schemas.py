@@ -17,8 +17,7 @@ class StartMessage(BaseModel):
 class AmdGpuInfoResponse(BaseModel):
     device_id: int = Field(ge=0)
     name: str = Field(min_length=1)
-    bus_id: Optional[str] = None
-    uuid: Optional[str] = None
+    gfx_version: Optional[str] = None
 
 
 class AmdGpuListResponse(BaseModel):

@@ -122,8 +122,7 @@ class AudioLibraryFile:
 class AmdGpuInfo:
     device_id: int
     name: str
-    bus_id: Optional[str] = None
-    uuid: Optional[str] = None
+    gfx_version: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -168,20 +167,9 @@ def _parse_rocm_smi_gpus(payload: str) -> list[AmdGpuInfo]:
         if device_id is None:
             continue
 
-        name = (
-            _clean_optional_text(details.get("Device Name"))
-            or _clean_optional_text(details.get("Card series"))
-            or _clean_optional_text(details.get("Product Name"))
-            or _clean_optional_text(details.get("Marketing Name"))
-            or f"AMD GPU {device_id}"
-        )
-        bus_id = (
-            _clean_optional_text(details.get("PCI Bus"))
-            or _clean_optional_text(details.get("PCI Bus ID"))
-            or _clean_optional_text(details.get("PCIe Bus"))
-        )
-        uuid = _clean_optional_text(details.get("Unique ID")) or _clean_optional_text(details.get("UUID"))
-        gpus.append(AmdGpuInfo(device_id=device_id, name=name, bus_id=bus_id, uuid=uuid))
+        name = _clean_optional_text(details.get("Card Series"))
+        gfx_version = _clean_optional_text(details.get("GFX Version"))
+        gpus.append(AmdGpuInfo(device_id=device_id, name=name, gfx_version=gfx_version))
 
     if not gpus:
         raise ValueError("No GPU entries found in rocm-smi output.")
@@ -210,14 +198,12 @@ def _parse_rocminfo_gpus(payload: str) -> list[AmdGpuInfo]:
             continue
 
         name = parsed.get("Marketing Name") or parsed.get("Name") or f"AMD GPU {len(gpus)}"
-        bus_id = parsed.get("BDFID") or parsed.get("PCI Bus")
-        uuid = parsed.get("Uuid") or parsed.get("UUID")
+        gfx_version = parsed.get("GFXIP")
         gpus.append(
             AmdGpuInfo(
                 device_id=len(gpus),
                 name=name.strip(),
-                bus_id=bus_id.strip() if isinstance(bus_id, str) and bus_id.strip() else None,
-                uuid=uuid.strip() if isinstance(uuid, str) and uuid.strip() else None,
+                gfx_version=gfx_version.strip() if isinstance(gfx_version, str) and gfx_version.strip() else None,
             )
         )
 
@@ -232,7 +218,7 @@ def detect_amd_gpus() -> AmdGpuInventory:
     detection_attempts = (
         (
             "rocm-smi",
-            ["rocm-smi", "--showproductname", "--showbus", "--showuniqueid", "--json"],
+            ["rocm-smi", "--showproductname", "--showgfxversion", "--json"],
             _parse_rocm_smi_gpus,
         ),
         ("rocminfo", ["rocminfo"], _parse_rocminfo_gpus),

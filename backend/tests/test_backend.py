@@ -166,14 +166,12 @@ def test_parse_rocm_smi_output() -> None:
         json.dumps(
             {
                 "card0": {
-                    "Device Name": "AMD Radeon Pro W6800",
-                    "PCI Bus": "0000:03:00.0",
-                    "Unique ID": "GPU-0",
+                    "Card Series": "AMD Radeon Pro W6800",
+                    "GFX Version": "1100",
                 },
                 "card1": {
-                    "Card series": "AMD Instinct MI210",
-                    "PCI Bus ID": "0000:04:00.0",
-                    "UUID": "GPU-1",
+                    "Card Series": "AMD Instinct MI210",
+                    "GFX Version": "90a",
                 },
             }
         )
@@ -181,8 +179,7 @@ def test_parse_rocm_smi_output() -> None:
 
     assert [gpu.device_id for gpu in parsed] == [0, 1]
     assert parsed[0].name == "AMD Radeon Pro W6800"
-    assert parsed[1].bus_id == "0000:04:00.0"
-    assert parsed[1].uuid == "GPU-1"
+    assert parsed[1].gfx_version == "90a"
 
 
 def test_list_audios_endpoint(monkeypatch) -> None:
@@ -233,8 +230,7 @@ def test_list_amd_gpus_endpoint(monkeypatch) -> None:
                 AmdGpuInfo(
                     device_id=0,
                     name="AMD Instinct MI210",
-                    bus_id="0000:03:00.0",
-                    uuid="GPU-0",
+                    gfx_version="90a",
                 )
             ],
             detected_at="2026-04-03T00:00:00+00:00",
@@ -252,8 +248,7 @@ def test_list_amd_gpus_endpoint(monkeypatch) -> None:
         {
             "device_id": 0,
             "name": "AMD Instinct MI210",
-            "bus_id": "0000:03:00.0",
-            "uuid": "GPU-0",
+            "gfx_version": "90a",
         }
     ]
 

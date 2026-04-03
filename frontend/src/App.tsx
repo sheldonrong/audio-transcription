@@ -9,8 +9,7 @@ type Mode = "transcription" | "display" | "v2a";
 type AmdGpu = {
   device_id: number;
   name: string;
-  bus_id: string | null;
-  uuid: string | null;
+  gfx_version: string | null;
 };
 
 const GPU_SELECTION_STORAGE_KEY = "dtd:selected-amd-gpu-ids";
@@ -86,7 +85,7 @@ export default function App() {
         }
 
         const payload = (await response.json()) as {
-          gpus?: Array<{ device_id?: unknown; name?: unknown; bus_id?: unknown; uuid?: unknown }>;
+          gpus?: Array<{ device_id?: unknown; name?: unknown; gfx_version?: unknown }>;
           detection_error?: unknown;
         };
         const normalized = Array.isArray(payload.gpus)
@@ -100,8 +99,8 @@ export default function App() {
               .map((entry) => ({
                 device_id: Number(entry.device_id),
                 name: String(entry.name),
-                bus_id: typeof entry.bus_id === "string" && entry.bus_id.trim() ? entry.bus_id : null,
-                uuid: typeof entry.uuid === "string" && entry.uuid.trim() ? entry.uuid : null,
+                gfx_version:
+                  typeof entry.gfx_version === "string" && entry.gfx_version.trim() ? entry.gfx_version : null,
               }))
           : [];
 
@@ -165,7 +164,6 @@ export default function App() {
           <div className="mode-header-top">
             <div className="mode-title-wrap">
               <h1>Audio Transcription</h1>
-              <p className="header-meta">Inference selection: {selectedGpuLabel}</p>
             </div>
 
             <div className="settings-wrap" ref={settingsRef}>
@@ -196,8 +194,6 @@ export default function App() {
                     <div className="settings-list">
                       {amdGpus.map((gpu) => {
                         const checked = selectedAmdGpuIds.includes(gpu.device_id);
-                        const details = [gpu.bus_id, gpu.uuid].filter(Boolean).join(" | ");
-
                         return (
                           <label key={gpu.device_id} className="settings-option">
                             <input
@@ -206,8 +202,7 @@ export default function App() {
                               onChange={() => toggleGpuSelection(gpu.device_id)}
                             />
                             <span>
-                              <strong>GPU {gpu.device_id}</strong> {gpu.name}
-                              {details ? <small>{details}</small> : null}
+                              <strong>GPU {gpu.device_id}</strong> {gpu.name} ({gpu.gfx_version})
                             </span>
                           </label>
                         );

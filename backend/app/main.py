@@ -493,8 +493,7 @@ async def list_amd_gpus() -> AmdGpuListResponse:
             AmdGpuInfoResponse(
                 device_id=gpu.device_id,
                 name=gpu.name,
-                bus_id=gpu.bus_id,
-                uuid=gpu.uuid,
+                gfx_version=gpu.gfx_version,
             )
             for gpu in detected_amd_gpu_inventory.gpus
         ],
