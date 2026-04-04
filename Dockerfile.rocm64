@@ -51,7 +51,7 @@ WORKDIR /opt/ctranslate2-rocm
 
 RUN git clone https://github.com/arlo-phoenix/CTranslate2-rocm.git --recurse-submodules src
 
-RRUN cd /opt/ctranslate2-rocm/src \
+RUN cd /opt/ctranslate2-rocm/src \
     && CLANG_CMAKE_CXX_COMPILER=amdclang++ \
        CXX=amdclang++ \
        HIPCXX="$(hipconfig -l)/clang" \
