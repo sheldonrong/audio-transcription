@@ -1,0 +1,98 @@
+@@ -6,85 +6,22 @@
+COPY frontend/ ./
+RUN npm run build
+
+FROM rocm/dev-ubuntu-24.04:6.4-complete AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    AUDIO_DIR=/audios \
+    OUTPUT_DIR=/output \
+    WHISPER_DEVICE=rocm \
+    HSA_OVERRIDE_GFX_VERSION_0=9.0.6 \
+    HSA_OVERRIDE_GFX_VERSION_1=9.0.0 \
+    ROCM_PATH=/opt/rocm \
+    PYTHON_BIN=python3 \
+    LD_LIBRARY_PATH=/opt/rocm/lib/llvm/lib
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        ffmpeg \
+        git \
+        libgomp1 \
+        libomp-dev \
+        libjpeg-dev \
+        libomp5 \
+        pybind11-dev \
+        python3.12 \
+        python3.12-dev \
+        python3-pip \
+        python-is-python3 \
+        wget \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN if [ -e /usr/lib/x86_64-linux-gnu/libomp.so.5 ] && [ ! -e /usr/lib/x86_64-linux-gnu/libomp.so ]; then \
+        ln -s /usr/lib/x86_64-linux-gnu/libomp.so.5 /usr/lib/x86_64-linux-gnu/libomp.so; \
+    fi
+
+RUN ${PYTHON_BIN} -m pip install --break-system-packages --no-cache-dir wheel setuptools
+
+WORKDIR /opt/ctranslate2-rocm
+
+RUN git clone https://github.com/arlo-phoenix/CTranslate2-rocm.git --recurse-submodules src
+
+RUN cd /opt/ctranslate2-rocm/src \
+    && CLANG_CMAKE_CXX_COMPILER=amdclang++ \
+       CXX=amdclang++ \
+       HIPCXX="$(hipconfig -l)/clang" \
+       HIP_PATH="$(hipconfig -R)" \
+       cmake -S . -B build \
+           -DOPENMP_RUNTIME=COMP \
+           -DWITH_MKL=OFF \
+           -DWITH_HIP=ON \
+           -DCMAKE_HIP_ARCHITECTURES="${GFX_ARCH}" \
+           -DBUILD_TESTS=OFF \
+           -DWITH_CUDNN=ON
+
+RUN cd /opt/ctranslate2-rocm/src \
+    && cmake --build build -- -j"$(nproc)"
+
+RUN cd /opt/ctranslate2-rocm/src/build \
+    && cmake --install . \
+    && ldconfig
+
+RUN cd /opt/ctranslate2-rocm/src/python \
+    && ${PYTHON_BIN} -m pip install --break-system-packages --no-cache-dir -r install_requirements.txt \
+    && ${PYTHON_BIN} setup.py bdist_wheel
+
+WORKDIR /app
+
+COPY backend/requirements.txt /app/backend/requirements.txt
+RUN ${PYTHON_BIN} -m pip install --break-system-packages --no-cache-dir -r /app/backend/requirements.txt
+
+RUN ${PYTHON_BIN} -m pip uninstall -y ctranslate2 || true
+
+RUN test -n "$(find /opt/ctranslate2-rocm/src/python/dist -maxdepth 1 -name '*.whl' -print -quit)" \
+    && ${PYTHON_BIN} -m pip install --break-system-packages --no-cache-dir /opt/ctranslate2-rocm/src/python/dist/*.whl
+
+COPY backend /app/backend
+COPY --from=frontend-builder /app/frontend/dist /app/frontend/dist
+@@ -93,12 +30,13 @@
+RUN mkdir -p /audios /output
+RUN chmod +x /app/docker-entrypoint.sh
+
+RUN cd /tmp && curl -L https://raw.githubusercontent.com/sheldonrong/rocblas-radeon-vega/refs/heads/main/rocblas_72.tar.gz --output rocblas.tar.gz \
+    && tar -xvf rocblas.tar.gz && cp /tmp/rocblas/lib/rocblas/library/TensileLibrary_*_gfx900.* /opt/rocm-7.2.0/lib/rocblas/library/ \
+    && cp /tmp/rocblas/lib/rocblas/library/TensileLibrary_*_gfx906.* /opt/rocm-7.2.0/lib/rocblas/library/
+
+WORKDIR /app/backend
+
+EXPOSE 8000
+
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
