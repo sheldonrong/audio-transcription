@@ -18,6 +18,7 @@ from app.transcribe import (
     ModelManager,
     SegmentResult,
     TranscriptionInfo,
+    get_default_batch_size,
     get_default_compute_type,
     get_default_device,
     get_runtime_device,
@@ -76,13 +77,13 @@ def test_transcribe_audio_respects_cancel_event() -> None:
     class FakeInfo:
         duration = 12.0
 
-    class FakeModel:
+    class FakePipeline:
         def transcribe(self, *_args, **_kwargs):
             return [FakeSegment()], FakeInfo()
 
     class FakeManager:
-        def get(self, _model_name: str, **_kwargs):
-            return FakeModel()
+        def get_batched_pipeline(self, _model_name: str, **_kwargs):
+            return FakePipeline()
 
     cancel_event = threading.Event()
     events = transcribe_audio(
@@ -127,6 +128,15 @@ def test_compute_type_env_override(monkeypatch) -> None:
     assert get_default_compute_type("cpu") == "float32"
 
 
+def test_batch_size_defaults_to_2() -> None:
+    assert get_default_batch_size() == 2
+
+
+def test_batch_size_env_override(monkeypatch) -> None:
+    monkeypatch.setenv("WHISPER_BATCH_SIZE", "6")
+    assert get_default_batch_size() == 6
+
+
 def test_device_env_override(monkeypatch) -> None:
     monkeypatch.setenv("WHISPER_DEVICE", "cpu")
     assert get_default_device() == "cpu"
@@ -147,12 +157,18 @@ def test_rocm_device_maps_to_cuda_runtime() -> None:
 
 def test_model_manager_evicts_stale_device_specific_models(monkeypatch) -> None:
     created: list[dict[str, object]] = []
+    created_pipelines: list[object] = []
 
     class FakeWhisperModel:
         def __init__(self, _model_name: str, **kwargs):
             created.append(kwargs)
 
+    class FakeBatchedInferencePipeline:
+        def __init__(self, model):
+            created_pipelines.append(model)
+
     monkeypatch.setattr(transcribe_module, "WhisperModel", FakeWhisperModel)
+    monkeypatch.setattr(transcribe_module, "BatchedInferencePipeline", FakeBatchedInferencePipeline)
     monkeypatch.setattr(
         transcribe_module,
         "get_detected_amd_gpu_inventory",
@@ -167,12 +183,49 @@ def test_model_manager_evicts_stale_device_specific_models(monkeypatch) -> None:
 
     manager = ModelManager(device="rocm")
     manager.get("medium", device_ids=[0, 1])
+    manager.get_batched_pipeline("medium", device_ids=[0, 1])
     manager.get("medium", device_ids=[0])
 
     assert len(manager._models) == 1
+    assert len(manager._batched_pipelines) == 0
     assert ("medium", (0,)) in manager._models
     assert created[0]["device_index"] == [0, 1]
     assert created[1]["device_index"] == 0
+    assert len(created_pipelines) == 1
+
+
+def test_transcribe_audio_uses_batched_pipeline_with_batch_size_from_env_default() -> None:
+    captured: dict[str, object] = {}
+
+    class FakeSegment:
+        start = 0.0
+        end = 1.0
+        text = "hello"
+
+    class FakeInfo:
+        duration = 3.0
+
+    class FakePipeline:
+        def transcribe(self, *_args, **kwargs):
+            captured.update(kwargs)
+            return [FakeSegment()], FakeInfo()
+
+    class FakeManager:
+        def get_batched_pipeline(self, _model_name: str, **_kwargs):
+            return FakePipeline()
+
+    events = list(
+        transcribe_audio(
+            model_manager=FakeManager(),  # type: ignore[arg-type]
+            audio_source=b"fake audio",
+            model_name="medium",
+            language="en",
+        )
+    )
+
+    assert len(events) == 2
+    assert captured["batch_size"] == 2
+    assert captured["language"] == "en"
 
 
 def test_device_normalization() -> None:

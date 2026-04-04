@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Sequence
 
-from faster_whisper import WhisperModel
+from faster_whisper import BatchedInferencePipeline, WhisperModel
 
 DEFAULT_MODEL = "medium"
 MAX_UPLOAD_BYTES = 1024 * 1024 * 1024
@@ -87,8 +87,25 @@ def get_default_compute_type(device: str) -> str:
     return "float16"
 
 
+def get_default_batch_size() -> int:
+    configured = _read_env_setting("WHISPER_BATCH_SIZE")
+    if not configured:
+        return 2
+
+    try:
+        value = int(configured)
+    except ValueError as exc:
+        raise ValueError(f"Invalid WHISPER_BATCH_SIZE '{configured}'. Expected a positive integer.") from exc
+
+    if value <= 0:
+        raise ValueError(f"Invalid WHISPER_BATCH_SIZE '{configured}'. Expected a positive integer.")
+
+    return value
+
+
 DEFAULT_DEVICE = get_default_device()
 DEFAULT_COMPUTE_TYPE = get_default_compute_type(DEFAULT_DEVICE)
+DEFAULT_BATCH_SIZE = get_default_batch_size()
 
 
 class TranscriptionError(Exception):
@@ -321,7 +338,8 @@ class ModelManager:
         self.runtime_device = get_runtime_device(resolved_device)
         self.compute_type = resolved_compute_type
         self._models: dict[tuple[str, tuple[int, ...]], WhisperModel] = {}
-        self._lock = threading.Lock()
+        self._batched_pipelines: dict[tuple[str, tuple[int, ...]], BatchedInferencePipeline] = {}
+        self._lock = threading.RLock()
 
     def _evict_conflicting_models(
         self,
@@ -338,6 +356,7 @@ class ModelManager:
 
         for key in stale_keys:
             del self._models[key]
+            self._batched_pipelines.pop(key, None)
 
         # Drop Python references promptly so the underlying CTranslate2 runtime
         # can release device allocations when the selected GPU set changes.
@@ -388,6 +407,26 @@ class ModelManager:
 
             self._models[cache_key] = model
             return model
+
+    def get_batched_pipeline(
+        self,
+        model_name: str,
+        device_ids: Optional[Sequence[int]] = None,
+    ) -> BatchedInferencePipeline:
+        normalized_device_ids = validate_device_ids(self.device, device_ids)
+        cache_key = (model_name, normalized_device_ids)
+
+        with self._lock:
+            if cache_key in self._batched_pipelines:
+                return self._batched_pipelines[cache_key]
+
+            model = self._models.get(cache_key)
+            if model is None:
+                model = self.get(model_name, device_ids=device_ids)
+
+            pipeline = BatchedInferencePipeline(model=model)
+            self._batched_pipelines[cache_key] = pipeline
+            return pipeline
 
 
 def validate_upload(filename: str, payload: bytes) -> None:
@@ -546,16 +585,16 @@ def transcribe_audio(
     device_ids: Optional[Sequence[int]] = None,
     cancel_event: Optional[threading.Event] = None,
 ):
-    model = model_manager.get(model_name, device_ids=device_ids)
+    pipeline = model_manager.get_batched_pipeline(model_name, device_ids=device_ids)
     audio_input = io.BytesIO(audio_source) if isinstance(audio_source, bytes) else str(audio_source)
 
     whisper_language = None if language in (None, "", "auto") else language
 
     try:
-        segments, info = model.transcribe(
+        segments, info = pipeline.transcribe(
             audio_input,
+            batch_size=DEFAULT_BATCH_SIZE,
             language=whisper_language,
-            vad_filter=True,
             condition_on_previous_text=True,
         )
     except Exception as exc:  # noqa: BLE001
