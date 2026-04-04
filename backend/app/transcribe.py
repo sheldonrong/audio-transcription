@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import io
 import json
+import logging
 import os
 import re
 import subprocess
@@ -39,6 +40,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_AUDIO_DIR = Path("/audios")
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output"
 SUPPORTED_DEVICES = {"cpu", "cuda", "rocm"}
+logger = logging.getLogger(__name__)
 
 
 def get_upload_limit_message() -> str:
@@ -354,6 +356,13 @@ class ModelManager:
         if not stale_keys:
             return
 
+        logger.info(
+            "Evicting stale WhisperModel cache entries pid=%s model=%s keep_device_ids=%s evicted=%s",
+            os.getpid(),
+            model_name,
+            list(normalized_device_ids),
+            [list(key[1]) for key in stale_keys],
+        )
         for key in stale_keys:
             del self._models[key]
             self._batched_pipelines.pop(key, None)
@@ -368,9 +377,23 @@ class ModelManager:
 
         with self._lock:
             if cache_key in self._models:
+                logger.info(
+                    "WhisperModel cache hit pid=%s model=%s device_ids=%s",
+                    os.getpid(),
+                    model_name,
+                    list(normalized_device_ids),
+                )
                 return self._models[cache_key]
 
             self._evict_conflicting_models(model_name, normalized_device_ids)
+            logger.info(
+                "WhisperModel cache miss pid=%s model=%s device_ids=%s runtime_device=%s compute_type=%s",
+                os.getpid(),
+                model_name,
+                list(normalized_device_ids),
+                self.runtime_device,
+                self.compute_type,
+            )
 
             try:
                 model_kwargs: dict[str, object] = {
@@ -418,12 +441,25 @@ class ModelManager:
 
         with self._lock:
             if cache_key in self._batched_pipelines:
+                logger.info(
+                    "BatchedInferencePipeline cache hit pid=%s model=%s device_ids=%s",
+                    os.getpid(),
+                    model_name,
+                    list(normalized_device_ids),
+                )
                 return self._batched_pipelines[cache_key]
 
             model = self._models.get(cache_key)
             if model is None:
                 model = self.get(model_name, device_ids=device_ids)
 
+            logger.info(
+                "BatchedInferencePipeline cache miss pid=%s model=%s device_ids=%s batch_size=%s",
+                os.getpid(),
+                model_name,
+                list(normalized_device_ids),
+                DEFAULT_BATCH_SIZE,
+            )
             pipeline = BatchedInferencePipeline(model=model)
             self._batched_pipelines[cache_key] = pipeline
             return pipeline
