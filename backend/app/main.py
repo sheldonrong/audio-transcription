@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import mimetypes
 import re
 import subprocess
@@ -75,6 +76,7 @@ from app.transcribe import (
 )
 
 app = FastAPI(title="Live Transcription API", version="1.0.0")
+logger = logging.getLogger(__name__)
 
 app.add_middleware(
     CORSMiddleware,
@@ -868,6 +870,11 @@ async def iter_transcription_events(
                     break
                 loop.call_soon_threadsafe(queue.put_nowait, item)
         except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "Transcription worker failed model=%s device_ids=%s",
+                model_name,
+                device_ids,
+            )
             loop.call_soon_threadsafe(queue.put_nowait, exc)
         finally:
             loop.call_soon_threadsafe(queue.put_nowait, sentinel)

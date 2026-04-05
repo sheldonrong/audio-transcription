@@ -34,7 +34,7 @@ type UploadAudioResponse = {
   path?: unknown;
 };
 
-const DEFAULT_LANGUAGE = "auto";
+const DEFAULT_LANGUAGE = "en";
 const DEFAULT_MODEL = "medium";
 const AUDIO_FILE_ACCEPT = "audio/*,.wav,.mp3,.m4a,.mp4,.aac,.ogg,.flac,.webm,.3gp,.amr,.opus,.caf";
 

@@ -9,7 +9,7 @@ class StartMessage(BaseModel):
     type: Literal["start"]
     filename: str = Field(min_length=1)
     audio_path: Optional[str] = None
-    language: Optional[str] = "auto"
+    language: Optional[str] = "en"
     model: Optional[str] = "medium"
     device_ids: list[int] = Field(default_factory=list)
 

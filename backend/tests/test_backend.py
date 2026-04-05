@@ -5,6 +5,7 @@ import threading
 import zipfile
 from pathlib import Path
 
+import numpy as np
 import app.transcribe as transcribe_module
 from fastapi.testclient import TestClient
 
@@ -68,22 +69,45 @@ def test_validate_video_upload_extension() -> None:
         assert "Unsupported video extension" in str(exc)
 
 
-def test_transcribe_audio_respects_cancel_event() -> None:
+def test_transcribe_audio_respects_cancel_event(monkeypatch) -> None:
     class FakeSegment:
         start = 0.0
         end = 1.0
         text = "hello"
 
-    class FakeInfo:
-        duration = 12.0
+    class FakeModel:
+        feature_extractor = type("FeatureExtractor", (), {"sampling_rate": 16000})()
 
-    class FakePipeline:
         def transcribe(self, *_args, **_kwargs):
-            return [FakeSegment()], FakeInfo()
+            return [FakeSegment()], object()
 
     class FakeManager:
-        def get_batched_pipeline(self, _model_name: str, **_kwargs):
-            return FakePipeline()
+        device = "cuda"
+
+        def __init__(self) -> None:
+            self.model = FakeModel()
+
+        def get(self, _model_name: str, device_ids=None):
+            return self.model
+
+    monkeypatch.setattr(
+        transcribe_module,
+        "decode_audio",
+        lambda *_args, **_kwargs: np.zeros(16000, dtype=np.float32),
+    )
+    monkeypatch.setattr(
+        transcribe_module,
+        "_split_audio_with_vad",
+        lambda *_args, **_kwargs: [
+            transcribe_module.AudioChunk(
+                index=0,
+                waveform=np.zeros(16000, dtype=np.float32),
+                speech_segments=[{"start": 0, "end": 16000}],
+            )
+        ],
+    )
+    monkeypatch.setattr(transcribe_module, "_detect_transcription_language", lambda *_args, **_kwargs: "en")
+    monkeypatch.setattr(transcribe_module, "restore_speech_timestamps", lambda segments, *_args: segments)
 
     cancel_event = threading.Event()
     events = transcribe_audio(
@@ -155,20 +179,14 @@ def test_rocm_device_maps_to_cuda_runtime() -> None:
     assert manager.compute_type == "float16"
 
 
-def test_model_manager_evicts_stale_device_specific_models(monkeypatch) -> None:
+def test_model_manager_keeps_device_specific_models_available_for_parallel_workers(monkeypatch) -> None:
     created: list[dict[str, object]] = []
-    created_pipelines: list[object] = []
 
     class FakeWhisperModel:
         def __init__(self, _model_name: str, **kwargs):
             created.append(kwargs)
 
-    class FakeBatchedInferencePipeline:
-        def __init__(self, model):
-            created_pipelines.append(model)
-
     monkeypatch.setattr(transcribe_module, "WhisperModel", FakeWhisperModel)
-    monkeypatch.setattr(transcribe_module, "BatchedInferencePipeline", FakeBatchedInferencePipeline)
     monkeypatch.setattr(
         transcribe_module,
         "get_detected_amd_gpu_inventory",
@@ -182,19 +200,21 @@ def test_model_manager_evicts_stale_device_specific_models(monkeypatch) -> None:
     )
 
     manager = ModelManager(device="rocm")
-    manager.get("medium", device_ids=[0, 1])
-    manager.get_batched_pipeline("medium", device_ids=[0, 1])
     manager.get("medium", device_ids=[0])
+    manager.get("medium", device_ids=[1])
+    manager.get("medium", device_ids=[0, 1])
 
-    assert len(manager._models) == 1
-    assert len(manager._batched_pipelines) == 0
+    assert len(manager._models) == 3
     assert ("medium", (0,)) in manager._models
-    assert created[0]["device_index"] == [0, 1]
-    assert created[1]["device_index"] == 0
-    assert len(created_pipelines) == 1
+    assert ("medium", (1,)) in manager._models
+    assert ("medium", (0, 1)) in manager._models
+    assert created[0]["device_index"] == 0
+    assert created[1]["device_index"] == 1
+    assert created[2]["device_index"] == [0, 1]
+    assert created[2]["num_workers"] == 2
 
 
-def test_transcribe_audio_uses_batched_pipeline_with_batch_size_from_env_default() -> None:
+def test_transcribe_audio_uses_whisper_model_api_with_manual_vad_chunks(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     class FakeSegment:
@@ -202,17 +222,40 @@ def test_transcribe_audio_uses_batched_pipeline_with_batch_size_from_env_default
         end = 1.0
         text = "hello"
 
-    class FakeInfo:
-        duration = 3.0
+    class FakeModel:
+        feature_extractor = type("FeatureExtractor", (), {"sampling_rate": 16000})()
 
-    class FakePipeline:
         def transcribe(self, *_args, **kwargs):
             captured.update(kwargs)
-            return [FakeSegment()], FakeInfo()
+            return [FakeSegment()], object()
 
     class FakeManager:
-        def get_batched_pipeline(self, _model_name: str, **_kwargs):
-            return FakePipeline()
+        device = "cuda"
+
+        def __init__(self) -> None:
+            self.model = FakeModel()
+
+        def get(self, _model_name: str, device_ids=None):
+            return self.model
+
+    monkeypatch.setattr(
+        transcribe_module,
+        "decode_audio",
+        lambda *_args, **_kwargs: np.zeros(16000, dtype=np.float32),
+    )
+    monkeypatch.setattr(
+        transcribe_module,
+        "_split_audio_with_vad",
+        lambda *_args, **_kwargs: [
+            transcribe_module.AudioChunk(
+                index=0,
+                waveform=np.zeros(16000, dtype=np.float32),
+                speech_segments=[{"start": 0, "end": 16000}],
+            )
+        ],
+    )
+    monkeypatch.setattr(transcribe_module, "_detect_transcription_language", lambda *_args, **_kwargs: "en")
+    monkeypatch.setattr(transcribe_module, "restore_speech_timestamps", lambda segments, *_args: segments)
 
     events = list(
         transcribe_audio(
@@ -224,8 +267,68 @@ def test_transcribe_audio_uses_batched_pipeline_with_batch_size_from_env_default
     )
 
     assert len(events) == 2
-    assert captured["batch_size"] == 2
     assert captured["language"] == "en"
+    assert captured["vad_filter"] is False
+    assert captured["condition_on_previous_text"] is False
+
+
+def test_parallel_chunk_scheduler_dispatches_next_chunk_when_worker_finishes(monkeypatch) -> None:
+    release_first_chunk = threading.Event()
+    third_chunk_started = threading.Event()
+    results: list[SegmentResult] = []
+    errors: list[Exception] = []
+
+    class FakeSegment:
+        def __init__(self, chunk_id: int) -> None:
+            self.start = float(chunk_id)
+            self.end = float(chunk_id) + 0.5
+            self.text = f"chunk-{chunk_id}"
+
+    class FakeModel:
+        feature_extractor = type("FeatureExtractor", (), {"sampling_rate": 16000})()
+
+        def transcribe(self, waveform, **_kwargs):
+            chunk_id = int(waveform[0])
+            if chunk_id == 0:
+                assert release_first_chunk.wait(timeout=2.0)
+            if chunk_id == 2:
+                third_chunk_started.set()
+            return [FakeSegment(chunk_id)], object()
+
+    monkeypatch.setattr(transcribe_module, "restore_speech_timestamps", lambda segments, *_args: segments)
+
+    chunks = [
+        transcribe_module.AudioChunk(index=0, waveform=np.array([0], dtype=np.float32), speech_segments=[{"start": 0, "end": 1}]),
+        transcribe_module.AudioChunk(index=1, waveform=np.array([1], dtype=np.float32), speech_segments=[{"start": 1, "end": 2}]),
+        transcribe_module.AudioChunk(index=2, waveform=np.array([2], dtype=np.float32), speech_segments=[{"start": 2, "end": 3}]),
+    ]
+
+    def consume() -> None:
+        try:
+            results.extend(
+                list(
+                    transcribe_module._iter_parallel_chunk_transcriptions(
+                        worker_models=[FakeModel(), FakeModel()],
+                        chunks=chunks,
+                        language="en",
+                        cancel_event=None,
+                    )
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    consumer = threading.Thread(target=consume)
+    consumer.start()
+
+    assert third_chunk_started.wait(timeout=1.0)
+    release_first_chunk.set()
+    consumer.join(timeout=2.0)
+
+    assert not consumer.is_alive()
+    assert errors == []
+    assert [result.text for result in results] == ["chunk-0", "chunk-1", "chunk-2"]
+    assert [result.index for result in results] == [0, 1, 2]
 
 
 def test_device_normalization() -> None:

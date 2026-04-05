@@ -112,7 +112,7 @@ Export browsing endpoints (for Display mode Transcription File dropdown):
 Client sends:
 1. JSON start message:
 ```json
-{"type":"start","filename":"sample.wav","audio_path":"sample.wav","language":"auto","model":"medium"}
+{"type":"start","filename":"sample.wav","audio_path":"sample.wav","language":"en","model":"medium"}
 ```
 2. If `audio_path` is omitted: send binary audio payload (single or multiple frames)
 3. If uploading bytes: send text frame `"__end__"` to signal upload completion

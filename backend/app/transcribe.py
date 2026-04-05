@@ -1,19 +1,23 @@
 from __future__ import annotations
 
-import gc
 import io
 import json
 import logging
 import os
+import queue
 import re
 import subprocess
 import threading
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Sequence
 
-from faster_whisper import BatchedInferencePipeline, WhisperModel
+import numpy as np
+from faster_whisper import WhisperModel
+from faster_whisper.audio import decode_audio
+from faster_whisper.transcribe import restore_speech_timestamps
+from faster_whisper.vad import VadOptions, collect_chunks, get_speech_timestamps
 
 DEFAULT_MODEL = "medium"
 MAX_UPLOAD_BYTES = 1024 * 1024 * 1024
@@ -136,6 +140,13 @@ class AudioLibraryFile:
     filename: str
     path: str
     size_bytes: int
+
+
+@dataclass(frozen=True)
+class AudioChunk:
+    index: int
+    waveform: np.ndarray
+    speech_segments: list[dict[str, int]]
 
 
 @dataclass(frozen=True)
@@ -340,36 +351,7 @@ class ModelManager:
         self.runtime_device = get_runtime_device(resolved_device)
         self.compute_type = resolved_compute_type
         self._models: dict[tuple[str, tuple[int, ...]], WhisperModel] = {}
-        self._batched_pipelines: dict[tuple[str, tuple[int, ...]], BatchedInferencePipeline] = {}
         self._lock = threading.RLock()
-
-    def _evict_conflicting_models(
-        self,
-        model_name: str,
-        normalized_device_ids: tuple[int, ...],
-    ) -> None:
-        stale_keys = [
-            key
-            for key in self._models
-            if key[0] == model_name and key[1] != normalized_device_ids
-        ]
-        if not stale_keys:
-            return
-
-        logger.info(
-            "Evicting stale WhisperModel cache entries pid=%s model=%s keep_device_ids=%s evicted=%s",
-            os.getpid(),
-            model_name,
-            list(normalized_device_ids),
-            [list(key[1]) for key in stale_keys],
-        )
-        for key in stale_keys:
-            del self._models[key]
-            self._batched_pipelines.pop(key, None)
-
-        # Drop Python references promptly so the underlying CTranslate2 runtime
-        # can release device allocations when the selected GPU set changes.
-        gc.collect()
 
     def get(self, model_name: str, device_ids: Optional[Sequence[int]] = None) -> WhisperModel:
         normalized_device_ids = validate_device_ids(self.device, device_ids)
@@ -385,7 +367,6 @@ class ModelManager:
                 )
                 return self._models[cache_key]
 
-            self._evict_conflicting_models(model_name, normalized_device_ids)
             logger.info(
                 "WhisperModel cache miss pid=%s model=%s device_ids=%s runtime_device=%s compute_type=%s",
                 os.getpid(),
@@ -431,38 +412,175 @@ class ModelManager:
             self._models[cache_key] = model
             return model
 
-    def get_batched_pipeline(
-        self,
-        model_name: str,
-        device_ids: Optional[Sequence[int]] = None,
-    ) -> BatchedInferencePipeline:
-        normalized_device_ids = validate_device_ids(self.device, device_ids)
-        cache_key = (model_name, normalized_device_ids)
 
-        with self._lock:
-            if cache_key in self._batched_pipelines:
-                logger.info(
-                    "BatchedInferencePipeline cache hit pid=%s model=%s device_ids=%s",
-                    os.getpid(),
-                    model_name,
-                    list(normalized_device_ids),
-                )
-                return self._batched_pipelines[cache_key]
+def _build_vad_options(
+    chunk_length: int,
+    vad_parameters: Optional[dict[str, object] | VadOptions] = None,
+) -> VadOptions:
+    if vad_parameters is None:
+        return VadOptions(
+            max_speech_duration_s=chunk_length,
+            min_silence_duration_ms=160,
+        )
 
-            model = self._models.get(cache_key)
-            if model is None:
-                model = self.get(model_name, device_ids=device_ids)
+    values = asdict(vad_parameters) if isinstance(vad_parameters, VadOptions) else dict(vad_parameters)
+    values["max_speech_duration_s"] = chunk_length
+    return VadOptions(**values)
 
-            logger.info(
-                "BatchedInferencePipeline cache miss pid=%s model=%s device_ids=%s batch_size=%s",
-                os.getpid(),
-                model_name,
-                list(normalized_device_ids),
-                DEFAULT_BATCH_SIZE,
+
+def _split_audio_with_vad(model: WhisperModel, audio: np.ndarray) -> list[AudioChunk]:
+    sampling_rate = model.feature_extractor.sampling_rate
+    chunk_length = model.feature_extractor.chunk_length
+    vad_options = _build_vad_options(chunk_length)
+    speech_segments = get_speech_timestamps(
+        audio,
+        vad_options=vad_options,
+        sampling_rate=sampling_rate,
+    )
+    audio_chunks, chunks_metadata = collect_chunks(
+        audio,
+        speech_segments,
+        sampling_rate=sampling_rate,
+        max_duration=chunk_length,
+    )
+
+    chunks = [
+        AudioChunk(
+            index=index,
+            waveform=waveform,
+            speech_segments=list(metadata.get("segments", [])),
+        )
+        for index, (waveform, metadata) in enumerate(zip(audio_chunks, chunks_metadata))
+        if waveform.size > 0
+    ]
+
+    kept_duration = (
+        sum((segment["end"] - segment["start"]) for segment in speech_segments) / sampling_rate
+        if speech_segments
+        else 0.0
+    )
+    removed_duration = max((audio.shape[0] / sampling_rate) - kept_duration, 0.0)
+    logger.info(
+        "Manual VAD split %s chunk(s) from %s speech segment(s); removed %.2fs of audio",
+        len(chunks),
+        len(speech_segments),
+        removed_duration,
+    )
+    return chunks
+
+
+def _transcribe_chunk(
+    model: WhisperModel,
+    chunk: AudioChunk,
+    language: Optional[str],
+    sampling_rate: int,
+) -> tuple[int, list[SegmentResult]]:
+    segments, _ = model.transcribe(
+        chunk.waveform,
+        language=language,
+        vad_filter=False,
+        condition_on_previous_text=False,
+    )
+
+    restored_segments = restore_speech_timestamps(segments, chunk.speech_segments, sampling_rate)
+    normalized_segments: list[SegmentResult] = []
+
+    for raw_segment in restored_segments:
+        text = (getattr(raw_segment, "text", "") or "").strip()
+        if not text:
+            continue
+        normalized_segments.append(
+            SegmentResult(
+                index=-1,
+                start=float(getattr(raw_segment, "start", 0.0)),
+                end=float(getattr(raw_segment, "end", 0.0)),
+                text=text,
             )
-            pipeline = BatchedInferencePipeline(model=model)
-            self._batched_pipelines[cache_key] = pipeline
-            return pipeline
+        )
+
+    return chunk.index, normalized_segments
+
+
+def _get_worker_models(
+    model_manager: ModelManager,
+    model_name: str,
+    device_ids: Optional[Sequence[int]],
+) -> list[WhisperModel]:
+    normalized_device_ids = validate_device_ids(model_manager.device, device_ids)
+    if not normalized_device_ids:
+        return [model_manager.get(model_name)]
+    return [model_manager.get(model_name, device_ids=[device_id]) for device_id in normalized_device_ids]
+
+
+def _iter_parallel_chunk_transcriptions(
+    worker_models: Sequence[WhisperModel],
+    chunks: Sequence[AudioChunk],
+    language: Optional[str],
+    cancel_event: Optional[threading.Event],
+):
+    sampling_rate = worker_models[0].feature_extractor.sampling_rate
+    chunk_queue: queue.Queue[AudioChunk] = queue.Queue()
+    result_queue: queue.Queue[tuple[int, list[SegmentResult]] | Exception] = queue.Queue()
+    stop_event = threading.Event()
+
+    for chunk in chunks:
+        chunk_queue.put(chunk)
+
+    def worker(model: WhisperModel) -> None:
+        while not stop_event.is_set() and not (cancel_event and cancel_event.is_set()):
+            try:
+                chunk = chunk_queue.get_nowait()
+            except queue.Empty:
+                return
+
+            try:
+                result_queue.put(_transcribe_chunk(model, chunk, language, sampling_rate))
+            except Exception as exc:  # noqa: BLE001
+                stop_event.set()
+                result_queue.put(exc)
+                return
+            finally:
+                chunk_queue.task_done()
+
+    for model in worker_models:
+        threading.Thread(target=worker, args=(model,), daemon=True).start()
+
+    buffered_results: dict[int, list[SegmentResult]] = {}
+    next_chunk_index = 0
+    next_segment_index = 0
+    completed_chunks = 0
+
+    while completed_chunks < len(chunks):
+        if cancel_event and cancel_event.is_set():
+            stop_event.set()
+            return
+
+        try:
+            item = result_queue.get(timeout=0.2)
+        except queue.Empty:
+            continue
+
+        if isinstance(item, Exception):
+            stop_event.set()
+            raise item
+
+        chunk_index, chunk_segments = item
+        buffered_results[chunk_index] = chunk_segments
+        completed_chunks += 1
+
+        while next_chunk_index in buffered_results:
+            for segment in buffered_results.pop(next_chunk_index):
+                if cancel_event and cancel_event.is_set():
+                    stop_event.set()
+                    return
+                yield SegmentResult(
+                    index=next_segment_index,
+                    start=segment.start,
+                    end=segment.end,
+                    text=segment.text,
+                )
+                next_segment_index += 1
+            next_chunk_index += 1
 
 
 def validate_upload(filename: str, payload: bytes) -> None:
@@ -617,34 +735,53 @@ def transcribe_audio(
     model_manager: ModelManager,
     audio_source: bytes | str | Path,
     model_name: str,
-    language: Optional[str],
+    language: str = "en",
     device_ids: Optional[Sequence[int]] = None,
     cancel_event: Optional[threading.Event] = None,
 ):
-    pipeline = model_manager.get_batched_pipeline(model_name, device_ids=device_ids)
-    audio_input = io.BytesIO(audio_source) if isinstance(audio_source, bytes) else str(audio_source)
-
-    whisper_language = None if language in (None, "", "auto") else language
-
     try:
-        segments, info = pipeline.transcribe(
-            audio_input,
-            batch_size=DEFAULT_BATCH_SIZE,
-            language=whisper_language,
-            condition_on_previous_text=True,
-        )
+        worker_models = _get_worker_models(model_manager, model_name, device_ids)
+        primary_model = worker_models[0]
+        sampling_rate = primary_model.feature_extractor.sampling_rate
+        audio_input = io.BytesIO(audio_source) if isinstance(audio_source, bytes) else str(audio_source)
+        audio = decode_audio(audio_input, sampling_rate=sampling_rate)
+        duration = audio.shape[0] / sampling_rate
+        chunks = _split_audio_with_vad(primary_model, audio)
     except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "Transcription setup failed model=%s device=%s device_ids=%s compute_type=%s",
+            model_name,
+            model_manager.device,
+            list(validate_device_ids(model_manager.device, device_ids)),
+            model_manager.compute_type,
+        )
         raise TranscriptionError(f"Failed to decode or transcribe audio: {exc}") from exc
 
-    duration = getattr(info, "duration", None)
     yield TranscriptionInfo(duration=duration)
 
-    for idx, segment in enumerate(segments):
-        if cancel_event and cancel_event.is_set():
-            return
-        yield SegmentResult(
-            index=idx,
-            start=float(getattr(segment, "start", 0.0)),
-            end=float(getattr(segment, "end", 0.0)),
-            text=(getattr(segment, "text", "") or "").strip(),
+    if cancel_event and cancel_event.is_set():
+        return
+
+    if not chunks:
+        return
+
+    try:
+        for segment in _iter_parallel_chunk_transcriptions(
+            worker_models=worker_models,
+            chunks=chunks,
+            language=language,
+            cancel_event=cancel_event,
+        ):
+            if cancel_event and cancel_event.is_set():
+                return
+            yield segment
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "Transcription execution failed model=%s device=%s device_ids=%s compute_type=%s chunks=%s",
+            model_name,
+            model_manager.device,
+            list(validate_device_ids(model_manager.device, device_ids)),
+            model_manager.compute_type,
+            len(chunks),
         )
+        raise TranscriptionError(f"Failed to decode or transcribe audio: {exc}") from exc
