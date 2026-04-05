@@ -13,6 +13,7 @@ type AmdGpu = {
 };
 
 const GPU_SELECTION_STORAGE_KEY = "dtd:selected-amd-gpu-ids";
+const AUTOSAVE_STORAGE_KEY = "dtd:autosave-enabled";
 
 function readStoredGpuIds(): number[] {
   try {
@@ -29,6 +30,19 @@ function readStoredGpuIds(): number[] {
       .filter((value) => Number.isInteger(value) && value >= 0);
   } catch {
     return [];
+  }
+}
+
+function readStoredAutosaveEnabled(): boolean {
+  try {
+    const raw = window.localStorage.getItem(AUTOSAVE_STORAGE_KEY);
+    if (raw === null) {
+      return true;
+    }
+    const parsed = JSON.parse(raw) as unknown;
+    return typeof parsed === "boolean" ? parsed : true;
+  } catch {
+    return true;
   }
 }
 
@@ -50,6 +64,7 @@ export default function App() {
   );
   const [amdGpus, setAmdGpus] = useState<AmdGpu[]>([]);
   const [selectedAmdGpuIds, setSelectedAmdGpuIds] = useState<number[]>(() => readStoredGpuIds());
+  const [autosaveEnabled, setAutosaveEnabled] = useState<boolean>(() => readStoredAutosaveEnabled());
   const [amdGpuLoading, setAmdGpuLoading] = useState(false);
   const [amdGpuError, setAmdGpuError] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -70,6 +85,10 @@ export default function App() {
   useEffect(() => {
     window.localStorage.setItem(GPU_SELECTION_STORAGE_KEY, JSON.stringify(selectedAmdGpuIds));
   }, [selectedAmdGpuIds]);
+
+  useEffect(() => {
+    window.localStorage.setItem(AUTOSAVE_STORAGE_KEY, JSON.stringify(autosaveEnabled));
+  }, [autosaveEnabled]);
 
   useEffect(() => {
     let cancelled = false;
@@ -179,6 +198,22 @@ export default function App() {
 
               {settingsOpen && (
                 <section className="settings-dropdown" aria-label="Inference settings">
+                  <label className="settings-switch-row">
+                    <span className="settings-switch-copy">
+                      <strong>Autosave</strong>
+                      <small>Save completed transcription files after transcribing.</small>
+                    </span>
+                    <span className="settings-switch">
+                      <input
+                        type="checkbox"
+                        role="switch"
+                        checked={autosaveEnabled}
+                        onChange={(event) => setAutosaveEnabled(event.target.checked)}
+                      />
+                      <span className="settings-switch-slider" aria-hidden="true" />
+                    </span>
+                  </label>
+
                   <div className="settings-copy">
                     <strong>AMD GPU Inference</strong>
                     <p className="meta">Choose the GPU IDs each transcription job should send to the backend.</p>
@@ -255,6 +290,7 @@ export default function App() {
             onTranscriptChange={setTranscript}
             onSegmentsChange={setSegments}
             selectedDeviceIds={selectedAmdGpuIds}
+            autosaveEnabled={autosaveEnabled}
           />
         ) : mode === "v2a" ? (
           <V2APage />

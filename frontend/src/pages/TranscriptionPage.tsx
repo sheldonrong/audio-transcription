@@ -26,6 +26,7 @@ type Props = {
   onTranscriptChange: (value: string) => void;
   onSegmentsChange: (segments: TranscribedSegment[]) => void;
   selectedDeviceIds: number[];
+  autosaveEnabled: boolean;
 };
 
 type UploadAudioResponse = {
@@ -104,6 +105,7 @@ export default function TranscriptionPage({
   onTranscriptChange,
   onSegmentsChange,
   selectedDeviceIds,
+  autosaveEnabled,
 }: Props) {
   const [status, setStatus] = useState<UiStatus>("idle");
   const [audioFiles, setAudioFiles] = useState<
@@ -129,6 +131,7 @@ export default function TranscriptionPage({
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
   const activeClientRef = useRef<TranscriptionWsClient | null>(null);
   const abortRequestedRef = useRef(false);
+  const autosaveTriggeredRef = useRef(false);
 
   const wsUrl = useMemo(() => getTranscriptionWsUrl(), []);
   const apiBaseUrl = useMemo(() => getApiBaseUrl(), []);
@@ -318,6 +321,7 @@ export default function TranscriptionPage({
     setExportResult(null);
     onTranscriptChange("");
     setSegments([]);
+    autosaveTriggeredRef.current = false;
     setTranscribedFileMeta({
       filename: selectedAudio.filename,
       path: selectedAudio.url || selectedAudio.path,
@@ -363,7 +367,7 @@ export default function TranscriptionPage({
     activeClientRef.current = client;
   };
 
-  const handleSaveTranscriptionFile = async () => {
+  const handleSaveTranscriptionFile = useCallback(async (saveMode: "manual" | "auto" = "manual") => {
     if (segments.length === 0) {
       return;
     }
@@ -421,14 +425,29 @@ export default function TranscriptionPage({
         typeof data.transcription_file_path === "string" ? data.transcription_file_path : "";
       setExportResult(
         transcriptionFilePath
-          ? `Transcription File saved to: ${transcriptionFilePath}`
-          : "Transcription File saved to OUTPUT_DIR.",
+          ? `${saveMode === "auto" ? "Autosaved" : "Transcription File saved"} to: ${transcriptionFilePath}`
+          : saveMode === "auto"
+            ? "Transcription File autosaved to OUTPUT_DIR."
+            : "Transcription File saved to OUTPUT_DIR.",
       );
     } catch (exportError) {
       const message = exportError instanceof Error ? exportError.message : "Failed to create Transcription File.";
-      setError(`Failed to create Transcription File: ${message}`);
+      setError(
+        saveMode === "auto"
+          ? `Failed to autosave Transcription File: ${message}`
+          : `Failed to create Transcription File: ${message}`,
+      );
     }
-  };
+  }, [apiBaseUrl, segments, selectedAudio, title, transcribedFileMeta]);
+
+  useEffect(() => {
+    if (!autosaveEnabled || status !== "complete" || segments.length === 0 || autosaveTriggeredRef.current) {
+      return;
+    }
+
+    autosaveTriggeredRef.current = true;
+    void handleSaveTranscriptionFile("auto");
+  }, [autosaveEnabled, handleSaveTranscriptionFile, segments.length, status]);
 
   return (
     <section className="mode-panel">
@@ -517,13 +536,15 @@ export default function TranscriptionPage({
         >
           Start Transcription
         </button>
-        <button
-          className="secondary-btn"
-          disabled={!title.trim() || segments.length === 0}
-          onClick={() => void handleSaveTranscriptionFile()}
-        >
-          Save
-        </button>
+        {!autosaveEnabled && (
+          <button
+            className="secondary-btn"
+            disabled={!title.trim() || segments.length === 0}
+            onClick={() => void handleSaveTranscriptionFile()}
+          >
+            Save
+          </button>
+        )}
         <button
           className="secondary-btn"
           disabled={status !== "connecting" && status !== "processing"}
