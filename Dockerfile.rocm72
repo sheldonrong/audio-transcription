@@ -14,8 +14,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     OUTPUT_DIR=/output \
     WHISPER_DEVICE=rocm \
     ROCR_VISIBLE_DEVICES=0,1 \
-    HSA_OVERRIDE_GFX_VERSION_0=9.0.6 \
-    HSA_OVERRIDE_GFX_VERSION_1=9.0.0 \
+    HSA_OVERRIDE_GFX_VERSION=9.0.6 \
     PYTHON_BIN=python3
 
 WORKDIR /app
@@ -31,8 +30,7 @@ RUN mkdir -p /audios /output
 RUN chmod +x /app/docker-entrypoint.sh
 
 RUN cd /tmp && curl -L https://raw.githubusercontent.com/sheldonrong/rocblas-radeon-vega/refs/heads/main/rocblas_72.tar.gz --output rocblas.tar.gz \
-    && tar -xvf rocblas.tar.gz && cp /tmp/rocblas/lib/rocblas/library/TensileLibrary_*_gfx900.* /opt/rocm-7.2.0/lib/rocblas/library/ \
-    && cp /tmp/rocblas/lib/rocblas/library/TensileLibrary_*_gfx906.* /opt/rocm-7.2.0/lib/rocblas/library/
+    && tar -xvf rocblas.tar.gz /opt/rocm-7.2.0/lib/rocblas/library/ && cp /tmp/rocblas/lib/rocblas/library/TensileLibrary_*_gfx906.* /opt/rocm-7.2.0/lib/rocblas/library/
 
 WORKDIR /app/backend
 

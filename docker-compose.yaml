@@ -12,7 +12,6 @@ services:
       AUDIO_DIR: /audios
       OUTPUT_DIR: /output
       WHISPER_DEVICE: rocm
-      HSA_OVERRIDE_GFX_VERSION: "9.0.0"
     devices:
       - /dev/kfd
       - /dev/dri
