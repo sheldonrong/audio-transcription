@@ -475,6 +475,9 @@ def _transcribe_chunk(
     language: Optional[str],
     sampling_rate: int,
 ) -> tuple[int, list[SegmentResult]]:
+    if not chunk.speech_segments:
+        return chunk.index, []
+
     segments, _ = model.transcribe(
         chunk.waveform,
         language=language,
